@@ -1,0 +1,16 @@
+# 忽略所有深度学习权重文件
+*.pth
+*.pt
+*.h5
+*.ckpt
+*.safetensors
+
+# 忽略缓存和输出文件
+checkpoints/
+outputs/
+*.mp4
+*.avi
+
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
