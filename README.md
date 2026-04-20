@@ -1,1 +1,8 @@
 # 2Dto3D
+mono23d.py xz师兄的fast-inpaint方法
+mono2stereo_lowres.py zc师兄的降分辨率处理后再上采样的方法
+mono2stereo_lower_fastinpaint.py 在xz师兄的框架上加入了降分辨率上采样的方法
+
+由于zc师兄的方法好像没有统计opencv写视频的时间，因此比较了mono23d和mono2stereo_lower_fastinpaint
+
+前者16.6帧，后者26.1帧。

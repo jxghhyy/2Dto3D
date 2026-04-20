@@ -22,8 +22,8 @@ import torch
 import torch.nn.functional as F
 from torchvision.transforms import Compose
 
-from depth_anything_v2.dpt import DepthAnythingV2
-from depth_anything_v2.util.transform import NormalizeImage, PrepareForNet, Resize
+from submodules.depth.dav2.depth_anything_v2.dpt import DepthAnythingV2
+from submodules.depth.dav2.depth_anything_v2.util.transform import NormalizeImage, PrepareForNet, MyResize
 
 
 def parse_args() -> argparse.Namespace:
@@ -279,7 +279,7 @@ def main() -> None:
 
     transform = Compose(
         [
-            Resize(
+            MyResize(
                 width=args.input_size,
                 height=args.input_size,
                 resize_target=False,

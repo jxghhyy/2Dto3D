@@ -8,8 +8,8 @@ import time
 import torch
 from torchvision.transforms import Compose
 
-from depth_anything_v2.dpt import DepthAnythingV2
-from depth_anything_v2.util.transform import NormalizeImage, PrepareForNet, Resize
+from submodules.depth.dav2.depth_anything_v2.dpt import DepthAnythingV2
+from submodules.depth.dav2.depth_anything_v2.util.transform import NormalizeImage, PrepareForNet, MyResize
 
 
 if __name__ == '__main__':
@@ -46,7 +46,7 @@ if __name__ == '__main__':
         depth_anything = depth_anything.half()
 
     transform = Compose([
-        Resize(
+        MyResize(
             width=args.input_size,
             height=args.input_size,
             resize_target=False,
