@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-path", type=str, required=True, help="输入视频路径、视频目录或txt列表")
     parser.add_argument("--output", type=str, default="./output.mp4", help="输出视频路径（单文件模式）")
     parser.add_argument("--outdir", type=str, default="./vis_video_3d", help="输出目录（批量模式）")
-    parser.add_argument("--input-size", type=int, default=518, help="DepthAnythingV2输入尺寸（正方形，必须14倍数）")
+    parser.add_argument("--input-size", type=int, default=518, help="DepthAnythingV2输入尺寸（长边像素，必须14倍数）")
     parser.add_argument("--encoder", type=str, default="vits", choices=["vits", "vitb", "vitl", "vitg"])
     parser.add_argument("--ckpt", type=str, default=None, help="模型权重路径，默认 checkpoints/depth_anything_v2_{encoder}.pth")
     parser.add_argument("--fp16", action="store_true", help="CUDA下启用fp16推理")
@@ -229,6 +229,20 @@ def fast_inpaint_gpu(
     return img
 
 
+def compute_aspect_preserved_size(orig_h: int, orig_w: int, long_edge: int) -> Tuple[int, int]:
+    """
+    保持宽高比，计算目标尺寸（确保两个维度都是 14 的倍数，符合 DepthAnythingV2 要求）
+    """
+    scale = long_edge / max(orig_h, orig_w)
+    new_h = int(round(orig_h * scale / 14)) * 14
+    new_w = int(round(orig_w * scale / 14)) * 14
+    # 确保至少有一个边等于 long_edge（舍入误差可能导致略小）
+    if max(new_h, new_w) != long_edge:
+        new_h = int(round(orig_h * scale / 14)) * 14
+        new_w = int(round(orig_w * scale / 14)) * 14
+    return new_h, new_w
+
+
 def compose_stereo(left_u8: np.ndarray, right_u8: np.ndarray, layout: str, overlay_alpha: float) -> np.ndarray:
     if layout == "sbs":
         return np.concatenate([left_u8, right_u8], axis=1)
@@ -302,7 +316,8 @@ def create_nvenc_writer(
 def preprocess_gpu(
     frame_bgr: np.ndarray,
     device: torch.device,
-    target_size: int,
+    target_h: int,
+    target_w: int,
     mean: Tuple[float, float, float],
     std: Tuple[float, float, float],
     stage_times: Dict[str, float],
@@ -310,7 +325,7 @@ def preprocess_gpu(
 ) -> torch.Tensor:
     """
     全GPU预处理：BGR→RGB + 归一化 + Resize 全部在 GPU 上完成
-    比 CPU 版本快 6-10 倍！
+    比 CPU 版本快 6-10 倍！支持保持宽高比。
     """
     # 1. BGR numpy → GPU tensor
     t0 = time.perf_counter()
@@ -326,9 +341,9 @@ def preprocess_gpu(
         torch.cuda.synchronize()
     _stage_add(stage_times, "prep_bgr_to_rgb", time.perf_counter() - t0)
     
-    # 3. GPU Resize (bilinear)
+    # 3. GPU Resize (bilinear) - 保持宽高比
     t0 = time.perf_counter()
-    img = F.interpolate(img.unsqueeze(0), (target_size, target_size), mode="bilinear", align_corners=False)[0]
+    img = F.interpolate(img.unsqueeze(0), (target_h, target_w), mode="bilinear", align_corners=False)[0]
     if profile_sync and device.type == "cuda":
         torch.cuda.synchronize()
     _stage_add(stage_times, "prep_resize_gpu", time.perf_counter() - t0)
@@ -408,8 +423,8 @@ def main() -> None:
     if args.fp16:
         model = model.half()
 
-    LOW_RES = args.input_size
-    assert LOW_RES % 14 == 0, f"input_size必须是14的倍数，你给的是{LOW_RES}"
+    LONG_EDGE = args.input_size
+    assert LONG_EDGE % 14 == 0, f"input_size必须是14的倍数，你给的是{LONG_EDGE}"
 
     # 预处理参数（和原来的 MyResize + Normalize 保持一致）
     MEAN = (0.485, 0.456, 0.406)
@@ -417,7 +432,7 @@ def main() -> None:
 
     if args.warmup_iters > 0:
         warmup_dtype = torch.float16 if args.fp16 else torch.float32
-        dummy = torch.randn(1, 3, LOW_RES, LOW_RES, device=device, dtype=warmup_dtype)
+        dummy = torch.randn(1, 3, LONG_EDGE, LONG_EDGE, device=device, dtype=warmup_dtype)
         for _ in range(args.warmup_iters):
             _ = model(dummy)
         torch.cuda.synchronize()
@@ -441,8 +456,13 @@ def main() -> None:
         h_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps_orig = float(cap.get(cv2.CAP_PROP_FPS))
         fps_orig = fps_orig if fps_orig > 0 else 30.0
-        print(f"[mono2stereo] original: {w_orig}×{h_orig}, FPS={fps_orig:.1f}")
-        print(f"[mono2stereo] low-res processing: {LOW_RES}×{LOW_RES}")
+        
+        # 计算保持宽高比的低分辨率尺寸（确保都是14的倍数）
+        low_h, low_w = compute_aspect_preserved_size(h_orig, w_orig, LONG_EDGE)
+        aspect_ratio = w_orig / h_orig
+        
+        print(f"[mono2stereo] original: {w_orig}×{h_orig} (aspect={aspect_ratio:.2f}), FPS={fps_orig:.1f}")
+        print(f"[mono2stereo] low-res processing: {low_w}×{low_h} (保持宽高比，长边={LONG_EDGE})")
         print(f"[mono2stereo] 🚀 优化: 全GPU预处理 + 多线程预读 (队列大小={args.queue_size})")
 
         if args.layout == "sbs":
@@ -472,7 +492,7 @@ def main() -> None:
             raise RuntimeError("ffmpeg管道初始化失败")
 
         print(f"[mono2stereo] max-disparity (low-res): {args.max_disparity:.1f} pixels "
-              f"→ original: {(args.max_disparity / LOW_RES * w_orig):.1f} pixels")
+              f"→ original: {(args.max_disparity / low_w * w_orig):.1f} pixels")
 
         stage_times: Dict[str, float] = {}
         processed_frames = 0
@@ -494,10 +514,10 @@ def main() -> None:
                 if not ok:
                     break
 
-                # Step 1: 全 GPU 预处理 + 深度推理
+                # Step 1: 全 GPU 预处理 + 深度推理（保持宽高比）
                 t0 = time.perf_counter()
                 img_gpu = preprocess_gpu(
-                    frame_bgr, device, LOW_RES, MEAN, STD,
+                    frame_bgr, device, low_h, low_w, MEAN, STD,
                     stage_times, args.profile_time
                 )
                 if args.fp16:
@@ -534,9 +554,9 @@ def main() -> None:
                     torch.cuda.synchronize()
                 _stage_add(stage_times, "depth_to_disparity_total", time.perf_counter() - t0)
 
-                # Step 4: 左图 resize 到低分辨率 + GPU DIBR
+                # Step 4: 左图 resize 到低分辨率 + GPU DIBR（保持宽高比）
                 t0 = time.perf_counter()
-                frame_low_bgr = cv2.resize(frame_bgr, (LOW_RES, LOW_RES), interpolation=cv2.INTER_LINEAR)
+                frame_low_bgr = cv2.resize(frame_bgr, (low_w, low_h), interpolation=cv2.INTER_LINEAR)
                 _stage_add(stage_times, "frame_resize_low_cpu", time.perf_counter() - t0)
                 
                 t0 = time.perf_counter()
@@ -573,14 +593,15 @@ def main() -> None:
 
                 # Step 6: 上采样 + 合成 (还是用 CPU，因为写 ffmpeg 必须要 CPU)
                 t0 = time.perf_counter()
-                left_u8_low = (left_rgb_low.clamp(0, 1) * 255.0).byte().contiguous().cpu().numpy()
+                # 左图直接用原图！不走低分辨率流程，避免画质损失
+                left_u8 = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                # 右图才需要上采样
                 right_u8_low = (right_inpainted_low.clamp(0, 1) * 255.0).byte().contiguous().cpu().numpy()
                 _stage_add(stage_times, "to_cpu_numpy", time.perf_counter() - t0)
                 
                 t0 = time.perf_counter()
-                left_u8 = cv2.resize(left_u8_low, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
                 right_u8 = cv2.resize(right_u8_low, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
-                _stage_add(stage_times, "upsample_to_orig", time.perf_counter() - t0)
+                _stage_add(stage_times, "upsample_right_to_orig", time.perf_counter() - t0)
 
                 t0 = time.perf_counter()
                 stereo = compose_stereo(left_u8, right_u8, args.layout, args.overlay_alpha)
