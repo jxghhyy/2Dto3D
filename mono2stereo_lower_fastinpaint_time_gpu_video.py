@@ -12,6 +12,10 @@
 #   ✅ 多线程预读队列 (CPU-GPU 并行)
 #   ✅ 预处理全GPU化 (Resize + Normalize 全在GPU)
 
+import sys
+sys.path.insert(0, '.')  # 主目录
+sys.path.insert(0, './submodules/Video_Depth_Anything')  # VDA 自己的 utils 目录
+
 import argparse
 import glob
 import os
@@ -30,6 +34,13 @@ from torchvision.transforms import Compose
 
 from submodules.depth.dav2.depth_anything_v2.dpt import DepthAnythingV2
 
+# 视频模型 import（放在这里，有 import 错误也不影响单帧模式）
+try:
+    from submodules.Video_Depth_Anything.video_depth_anything.video_depth_stream import VideoDepthAnything
+    VIDEO_MODEL_AVAILABLE = True
+except ImportError:
+    VIDEO_MODEL_AVAILABLE = False
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="2D转3D: 低分辨率DepthAnything + GPU DIBR + GPU FastInpaint")
@@ -38,9 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outdir", type=str, default="./vis_video_3d", help="输出目录（批量模式）")
     parser.add_argument("--input-size", type=int, default=518, help="DepthAnythingV2输入尺寸（长边像素，必须14倍数）")
     parser.add_argument("--encoder", type=str, default="vits", choices=["vits", "vitb", "vitl", "vitg"])
-    parser.add_argument("--video-model", action="store_true", help="使用DepthAnythingV2-Video多帧视频模型（需要权重）")
-    parser.add_argument("--temporal-frames", type=int, default=5, help="视频模型输入帧数（默认5帧）")
-    parser.add_argument("--ckpt", type=str, default=None, help="模型权重路径，默认 checkpoints/depth_anything_v2_{encoder}.pth")
+    parser.add_argument("--video-model", action="store_true", help="使用Video-Depth-Anything视频模型（内置时序一致性）")
+    parser.add_argument("--metric", action="store_true", help="视频模型使用 metric 深度版本")
+    parser.add_argument("--ckpt", type=str, default=None, help="模型权重路径，默认 checkpoints/video_depth_anything_{encoder}.pth")
     parser.add_argument("--fp16", action="store_true", help="CUDA下启用fp16推理")
     parser.add_argument("--warmup-iters", type=int, default=10, help="CUDA warmup轮数")
     parser.add_argument("--queue-size", type=int, default=8, help="预读队列大小（越大CPU-GPU重叠越好）")
@@ -421,24 +432,34 @@ def main() -> None:
     
     # ==================== 双模式支持 ====================
     if args.video_model:
-        # TODO: 等你拿到视频模型权重后，取消下面的注释并填入正确的 import
-        # from depth_anything_v2.dpt_video import DepthAnythingV2Video
-        model = DepthAnythingV2(**get_model_config(args.encoder), num_frames=args.temporal_frames)
-        ckpt = args.ckpt or f"checkpoints/video_depth_anything_v2_{args.encoder}.pth"
-        model.load_state_dict(torch.load(ckpt, map_location="cpu"))
-        model = model.to(device).eval()
-        if args.fp16:
-            model = model.half()
-        print(f"[mono2stereo] ✅ 使用视频模型，时序帧数: {args.temporal_frames}")
+        # Video-Depth-Anything 视频模型（内置时序一致性，官方流式推理）
+        if not VIDEO_MODEL_AVAILABLE:
+            raise ImportError(
+                "\n" + "="*70 + "\n"
+                "Video-Depth-Anything 导入失败！\n"
+                "请确认 submodules/Video-Depth-Anything 目录存在\n"
+                "或者先不加 --video-model，用单帧 + 光流平滑模式\n"
+                + "="*70
+            )
         
-        # 现在：提示用户需要权重
-        raise NotImplementedError(
-            "\n" + "="*70 + "\n"
-            "视频模型模式需要 DepthAnythingV2-Video 权重！\n"
-            "1. 拿到权重后，修改上面的模型 import 和加载代码\n"
-            "2. 或者先不加 --video-model，用光流后处理模式（推荐先用！）\n"
-            + "="*70
-        )
+        model_configs = {
+            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+        }
+        
+        model = VideoDepthAnything(**model_configs[args.encoder])
+        checkpoint_name = 'metric_video_depth_anything' if args.metric else 'video_depth_anything'
+        ckpt = args.ckpt or f"checkpoints/{checkpoint_name}_{args.encoder}.pth"
+        
+        print(f"[mono2stereo] 📦 加载视频模型: {ckpt}")
+        model.load_state_dict(torch.load(ckpt, map_location='cpu'), strict=True)
+        model = model.to(device).eval()
+        # 视频模型内部自己管理时序状态，不需要队列！
+        
+        print(f"[mono2stereo] ✅ 使用 Video-Depth-Anything (官方时序一致性)")
+        if args.metric:
+            print(f"[mono2stereo] ✅ Metric 深度模式")
     else:
         # 单帧模型 + 光流后处理平滑（现在就能跑！）
         model = DepthAnythingV2(**get_model_config(args.encoder))
@@ -448,10 +469,6 @@ def main() -> None:
         if args.fp16:
             model = model.half()
         print(f"[mono2stereo] ✅ 使用单帧模型 + 光流时序平滑")
-    
-    # 视频模型专用：维护时序帧队列
-    frame_queue = []
-    TEMPORAL_FRAMES = args.temporal_frames
 
     LONG_EDGE = args.input_size
     assert LONG_EDGE % 14 == 0, f"input_size必须是14的倍数，你给的是{LONG_EDGE}"
@@ -460,12 +477,13 @@ def main() -> None:
     MEAN = (0.485, 0.456, 0.406)
     STD = (0.229, 0.224, 0.225)
 
-    if args.warmup_iters > 0:
+    if args.warmup_iters > 0 and not args.video_model:
         warmup_dtype = torch.float16 if args.fp16 else torch.float32
         dummy = torch.randn(1, 3, LONG_EDGE, LONG_EDGE, device=device, dtype=warmup_dtype)
         for _ in range(args.warmup_iters):
             _ = model(dummy)
         torch.cuda.synchronize()
+    # 视频模型的 warmup 会在第一帧推理时自动完成
 
     files = collect_video_files(args.video_path)
     if not files:
@@ -545,34 +563,31 @@ def main() -> None:
                 if not ok:
                     break
 
-                # Step 1: 全 GPU 预处理 + 深度推理（保持宽高比）
+                # Step 1: 深度推理
                 t0 = time.perf_counter()
-                img_gpu = preprocess_gpu(
-                    frame_bgr, device, low_h, low_w, MEAN, STD,
-                    stage_times, args.profile_time
-                )
-                if args.fp16:
-                    img_gpu = img_gpu.half()
                 
                 # ==================== 双模式推理 ====================
                 if args.video_model:
-                    # 视频模型：攒够 N 帧再推理
-                    frame_queue.append(img_gpu)
-                    if len(frame_queue) < TEMPORAL_FRAMES:
-                        # 前几帧还没攒够，用单帧推理兜底
-                        depth_low = infer_depth_lowres(
-                            model, img_gpu, args.fp16,
-                            stage_times, args.profile_time
+                    # 视频模型：官方流式推理 API，内部维护时序状态
+                    # 输入是 numpy BGR 图像，内部自己做预处理
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.fp16):
+                        depth_low_np = model.infer_video_depth_one(
+                            frame_rgb, 
+                            input_size=args.input_size, 
+                            device=device, 
+                            fp32=(not args.fp16)
                         )
-                    else:
-                        # 多帧输入：[T, C, H, W] -> [1, T, C, H, W]
-                        temporal_input = torch.cat(list(frame_queue)[-TEMPORAL_FRAMES:], dim=0)
-                        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.fp16):
-                            pred = model(temporal_input.unsqueeze(0))  # 加 batch 维度
-                        depth_low = pred[0, -1].float()  # 取最后一帧的深度
-                        _stage_add(stage_times, "model_inference_video", time.perf_counter() - t0)
+                    depth_low = torch.from_numpy(depth_low_np).to(device=device, dtype=torch.float32)
+                    _stage_add(stage_times, "model_inference_video", time.perf_counter() - t0)
                 else:
-                    # 单帧模型（默认）
+                    # 单帧模型（默认）+ 我们自己的 GPU 加速预处理
+                    img_gpu = preprocess_gpu(
+                        frame_bgr, device, low_h, low_w, MEAN, STD,
+                        stage_times, args.profile_time
+                    )
+                    if args.fp16:
+                        img_gpu = img_gpu.half()
                     depth_low = infer_depth_lowres(
                         model, img_gpu, args.fp16,
                         stage_times, args.profile_time
@@ -582,9 +597,9 @@ def main() -> None:
                     torch.cuda.synchronize()
                 _stage_add(stage_times, "infer_depth_total", time.perf_counter() - t0)
 
-                # Step 2: 时序深度平滑（光流对齐 + 加权平均）
+                # Step 2: 时序深度平滑（视频模型模式下可以关闭，因为模型自带一致性）
                 # 核心思想：先把上一帧深度按运动扭曲到当前帧，再平滑，避免运动模糊
-                if args.depth_smooth > 0.0 and prev_depth is not None and prev_frame_gray is not None:
+                if not args.video_model and args.depth_smooth > 0.0 and prev_depth is not None and prev_frame_gray is not None:
                     t0 = time.perf_counter()
                     a = float(args.depth_smooth)
                     
@@ -618,7 +633,7 @@ def main() -> None:
                     depth_low = torch.where(valid_mask, depth_smoothed, depth_low)
                     
                     _stage_add(stage_times, "depth_smooth_flow", time.perf_counter() - t0)
-                elif args.depth_smooth > 0.0 and prev_depth is not None:
+                elif not args.video_model and args.depth_smooth > 0.0 and prev_depth is not None:
                     #  fallback：第一帧没有光流，用简单平滑
                     t0 = time.perf_counter()
                     a = float(args.depth_smooth)
@@ -626,7 +641,7 @@ def main() -> None:
                     _stage_add(stage_times, "depth_smooth_simple", time.perf_counter() - t0)
                 
                 prev_depth = depth_low
-                if args.depth_smooth > 0.0:
+                if not args.video_model and args.depth_smooth > 0.0:
                     prev_frame_gray = cv2.cvtColor(frame_low_bgr, cv2.COLOR_BGR2GRAY)
 
                 # Step 3: 深度转视差
@@ -646,7 +661,8 @@ def main() -> None:
 
                 # Step 4: 左图 resize 到低分辨率 + GPU DIBR（保持宽高比）
                 t0 = time.perf_counter()
-                frame_low_bgr = cv2.resize(frame_bgr, (low_w, low_h), interpolation=cv2.INTER_LINEAR)
+                # frame_low_bgr = cv2.resize(frame_bgr, (low_w, low_h), interpolation=cv2.INTER_LINEAR)
+                frame_low_bgr = frame_bgr  # 直接用原图
                 _stage_add(stage_times, "frame_resize_low_cpu", time.perf_counter() - t0)
                 
                 t0 = time.perf_counter()
@@ -722,7 +738,7 @@ def main() -> None:
         if args.profile_time and processed_frames > 0:
             print("[mono2stereo] 各阶段用时统计:")
             print("=" * 70)
-            
+            print(f"Depth min: {depth_low.min():.3f}, max: {depth_low.max():.3f}")
             # ========== 第一部分：顶层互斥阶段 ==========
             top_level = [
                 ("read_frame_queue", "从队列取帧 (后台预读)"),
