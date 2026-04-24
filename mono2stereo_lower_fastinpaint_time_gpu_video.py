@@ -65,8 +65,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-kernel", type=int, default=7, help="FAST补洞邻域核大小(奇数)")
     parser.add_argument("--fast-max-iter", type=int, default=64, help="FAST补洞最大迭代次数")
 
-    parser.add_argument("--layout", choices=["sbs", "ou", "overlay"], default="sbs", help="sbs并排, ou上下, overlay重合")
+    parser.add_argument("--layout", choices=["sbs", "ou", "overlay", "anaglyph"], default="sbs", help="sbs并排, ou上下, overlay重合")
     parser.add_argument("--overlay-alpha", type=float, default=0.5, help="overlay模式下右眼权重[0,1]")
+    parser.add_argument("--anaglyph-mode", choices=["red-cyan", "color"], default="red-cyan",help="anaglyph模式：red-cyan红绿眼镜用")
 
     parser.add_argument("--ffmpeg-bin", type=str, default="ffmpeg", help="ffmpeg可执行文件")
     parser.add_argument("--nvenc-preset", type=str, default="p4", help="NVENC preset")
@@ -261,6 +262,17 @@ def compose_stereo(left_u8: np.ndarray, right_u8: np.ndarray, layout: str, overl
         return np.concatenate([left_u8, right_u8], axis=1)
     if layout == "ou":
         return np.concatenate([left_u8, right_u8], axis=0)
+    if layout == "anaglyph":
+        # 红蓝3D：左眼看红色通道，右眼看青(绿+蓝)通道
+        h, w = left_u8.shape[:2]
+        result = np.zeros_like(left_u8)
+        # 左眼：保留红色通道
+        result[..., 0] = left_u8[..., 0]
+        # 右眼：保留绿色通道和蓝色通道
+        result[..., 1] = right_u8[..., 1]
+        result[..., 2] = right_u8[..., 2]
+        return result
+    # overlay 模式...
     a = float(np.clip(overlay_alpha, 0.0, 1.0))
     mixed = (1.0 - a) * left_u8.astype(np.float32) + a * right_u8.astype(np.float32)
     return np.clip(mixed, 0.0, 255.0).astype(np.uint8)
