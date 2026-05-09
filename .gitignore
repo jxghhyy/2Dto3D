@@ -1,0 +1,84 @@
+# ================ 模型权重（大文件，不要上传！）===============
+checkpoints/*.pth
+checkpoints/*.pt
+checkpoints/*.bin
+checkpoints/*.safetensors
+
+# NVDS 子模块下的所有权重
+submodules/NVDS/**/*.pth
+submodules/NVDS/**/*.pt
+submodules/NVDS/**/*.bin
+
+# 其他子模块的权重
+submodules/depth/**/*.pth
+submodules/Video_Depth_Anything/**/*.pth
+submodules/**/checkpoints/**/*
+
+# 损坏的 git 备份
+.git_broken/
+.git_old/
+.git_backup/
+
+# ================ 输出视频和图片 ================
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.bmp
+
+# 输出目录
+vis_video_3d/
+output/
+outputs/
+results/
+demo_outputs/
+vis/
+
+# ================ 临时和缓存文件 ================
+*.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ================ IDE 和编辑器 ================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ================ 日志 ================
+*.log
+logs/
+
+# ================ 数据集（如果有的话）===============
+datasets/
+data/
+
+# ================ 其他 ================
+*.npy
+*.npz
+*.pkl
+*.pickle
