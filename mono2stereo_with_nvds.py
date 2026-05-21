@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     # ===== DIBR + 补洞 =====
     parser.add_argument("--fast-kernel", type=int, default=7, help="FAST补洞邻域核大小(奇数)")
     parser.add_argument("--fast-max-iter", type=int, default=64, help="FAST补洞最大迭代次数")
-    parser.add_argument("--hole-dilate-left", type=int, default=2, help="hole向左膨胀像素，保护前景边缘（0=关闭）")
+    parser.add_argument("--hole-dilate-left", type=int, default=0, help="hole向左膨胀像素，保护前景边缘（0=关闭）")
 
     # ===== 输出格式 =====
     parser.add_argument("--layout", choices=["sbs", "ou", "overlay", "anaglyph"], default="sbs", help="sbs并排, ou上下, overlay重合")

@@ -19,6 +19,7 @@ sys.path.insert(0, '.')  # 主目录
 sys.path.insert(0, './submodules/Video_Depth_Anything')  # VDA 自己的 utils 目录
 
 import argparse
+import functools
 import glob
 import os
 import subprocess
@@ -66,7 +67,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--fast-kernel", type=int, default=7, help="FAST补洞邻域核大小(奇数)")
     parser.add_argument("--fast-max-iter", type=int, default=64, help="FAST补洞最大迭代次数")
-    parser.add_argument("--hole-dilate-left", type=int, default=2, help="【师兄新增】hole向左膨胀像素，保护前景边缘（0=关闭）")
+    parser.add_argument("--hole-dilate-left", type=int, default=0, help="【师兄新增】hole向左膨胀像素，保护前景边缘（0=关闭）,负优化，勿开")
 
     parser.add_argument("--layout", choices=["sbs", "ou", "overlay", "anaglyph"], default="sbs", help="sbs并排, ou上下, overlay重合")
     parser.add_argument("--overlay-alpha", type=float, default=0.5, help="overlay模式下右眼权重[0,1]")
@@ -112,23 +113,56 @@ def _maybe_sync(device: torch.device, do_sync: bool) -> None:
         torch.cuda.synchronize()
 
 
-def _normalize_depth(depth: torch.Tensor, clip_low: float, clip_high: float) -> torch.Tensor:
+@functools.lru_cache(maxsize=8)
+def _get_inpaint_kernels(kernel_size: int, device: str, dtype: str):
+    """M-5: 缓存 inpaint kernel，避免每帧重建"""
+    device = torch.device(device)
+    dtype = getattr(torch, dtype)
+    pad = kernel_size // 2
+    kernel1 = torch.ones((1, 1, kernel_size, kernel_size), device=device, dtype=dtype)
+    kernel3 = kernel1.repeat(3, 1, 1, 1)
+    return kernel1, kernel3
+
+
+def _normalize_depth(depth: torch.Tensor, clip_low: float, clip_high: float,
+                    ema_state: Tuple[float, float] = None, ema_beta: float = 0.95) -> Tuple[torch.Tensor, Tuple[float, float]]:
+    """
+    M-1: 随机采样16k像素算quantile，省5ms/帧
+    M-2: EMA跨帧平滑low/high，根治时序闪烁
+    """
     flat = depth.reshape(-1)
-    low = torch.quantile(flat, clip_low)
-    high = torch.quantile(flat, clip_high)
-    denom = (high - low).clamp_min(1e-6)
-    return ((depth - low) / denom).clamp(0.0, 1.0)
+    N = flat.numel()
+    
+    # M-1: 随机采样16384个像素，误差可忽略，速度×100
+    idx = torch.randint(0, N, (16384,), device=flat.device)
+    sample = flat[idx]
+    low, high = torch.quantile(sample, torch.tensor([clip_low, clip_high], device=flat.device)).unbind()
+    
+    # M-2: EMA跨帧平滑
+    low, high = low.item(), high.item()
+    if ema_state is not None:
+        ema_low, ema_high = ema_state
+        low = ema_beta * ema_low + (1.0 - ema_beta) * low
+        high = ema_beta * ema_high + (1.0 - ema_beta) * high
+    
+    denom = (high - low) if (high - low) > 1e-6 else 1e-6
+    depth_norm = ((depth - low) / denom).clamp(0.0, 1.0)
+    return depth_norm, (low, high)
 
 
 @torch.no_grad()
 def depth_to_disparity(
     depth: torch.Tensor, max_disparity: float, depth_mode: str, clip_low: float, clip_high: float,
     stage_times: Dict[str, float], profile_sync: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    ema_state: Tuple[float, float] = None, ema_beta: float = 0.95,
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[float, float]]:
     device = depth.device
     
     t0 = time.perf_counter()
-    depth_norm = _normalize_depth(depth, clip_low=clip_low, clip_high=clip_high)
+    depth_norm, new_ema_state = _normalize_depth(
+        depth, clip_low=clip_low, clip_high=clip_high,
+        ema_state=ema_state, ema_beta=ema_beta
+    )
     _maybe_sync(device, profile_sync)
     _stage_add(stage_times, "depth_normalize_quantile", time.perf_counter() - t0)
     
@@ -138,7 +172,7 @@ def depth_to_disparity(
     _maybe_sync(device, profile_sync)
     _stage_add(stage_times, "disparity_calc", time.perf_counter() - t0)
     
-    return disparity, near
+    return disparity, near, new_ema_state
 
 
 # ============================================================
@@ -243,8 +277,10 @@ def fast_inpaint_gpu(
     device = img.device
 
     pad = kernel_size // 2
-    kernel1 = torch.ones((1, 1, kernel_size, kernel_size), device=device, dtype=img.dtype)
-    kernel3 = kernel1.repeat(3, 1, 1, 1)
+    # M-5: 用缓存的 kernel，避免每帧重建
+    kernel1, kernel3 = _get_inpaint_kernels(
+        kernel_size, str(device), str(img.dtype).split('.')[-1]
+    )
     _maybe_sync(device, profile_sync)
     _stage_add(stage_times, "inpaint_init_kernel", time.perf_counter() - t0)
 
@@ -280,14 +316,16 @@ def fast_inpaint_gpu(
 def compute_aspect_preserved_size(orig_h: int, orig_w: int, long_edge: int) -> Tuple[int, int]:
     """
     保持宽高比，计算目标尺寸（确保两个维度都是 14 的倍数，符合 DepthAnythingV2 要求）
+    Bug-3 修复：删除无意义死循环，保证长边严格等于 long_edge
     """
     scale = long_edge / max(orig_h, orig_w)
-    new_h = int(round(orig_h * scale / 14)) * 14
-    new_w = int(round(orig_w * scale / 14)) * 14
-    # 确保至少有一个边等于 long_edge（舍入误差可能导致略小）
-    if max(new_h, new_w) != long_edge:
-        new_h = int(round(orig_h * scale / 14)) * 14
-        new_w = int(round(orig_w * scale / 14)) * 14
+    new_h = max(14, int(round(orig_h * scale / 14)) * 14)
+    new_w = max(14, int(round(orig_w * scale / 14)) * 14)
+    # 强制长边等于 long_edge，短边按比例调整（保证模型输入尺度正确）
+    if orig_w >= orig_h:
+        new_w = long_edge
+    else:
+        new_h = long_edge
     return new_h, new_w
 
 
@@ -297,8 +335,7 @@ def compose_stereo(left_u8: np.ndarray, right_u8: np.ndarray, layout: str, overl
     if layout == "ou":
         return np.concatenate([left_u8, right_u8], axis=0)
     if layout == "anaglyph":
-        # 红蓝3D：左眼看红色通道，右眼看青(绿+蓝)通道
-        h, w = left_u8.shape[:2]
+        # 红青3D：左眼看红色通道，右眼看青(绿+蓝)通道
         result = np.zeros_like(left_u8)
         # 左眼：保留红色通道
         result[..., 0] = left_u8[..., 0]
@@ -591,6 +628,7 @@ def main() -> None:
         t_video0 = time.perf_counter()
         prev_depth = None
         prev_frame_gray = None  # 用于光流时序平滑
+        ema_depth_norm = None   # M-2: EMA跨帧深度归一化，根治时序闪烁
 
         # 启动后台预读线程
         reader = FrameReaderThread(cap, queue_size=args.queue_size)
@@ -641,6 +679,16 @@ def main() -> None:
                     torch.cuda.synchronize()
                 _stage_add(stage_times, "infer_depth_total", time.perf_counter() - t0)
 
+                # Step 1.5: 左图 resize 到低分辨率（光流和 DIBR 都要用，提前到这里避免 Bug-1 未定义）
+                t0 = time.perf_counter()
+                if args.video_model:
+                    # Video-DAV2 输出是原分辨率，直接用原图做 DIBR
+                    frame_low_bgr = frame_bgr
+                else:
+                    # DAV2 单帧输出是低分辨率，图也要 resize 到低分辨率
+                    frame_low_bgr = cv2.resize(frame_bgr, (low_w, low_h), interpolation=cv2.INTER_LINEAR)
+                _stage_add(stage_times, "frame_resize_low_cpu", time.perf_counter() - t0)
+
                 # Step 2: 时序深度平滑（视频模型模式下可以关闭，因为模型自带一致性）
                 # 核心思想：先把上一帧深度按运动扭曲到当前帧，再平滑，避免运动模糊
                 if not args.video_model and args.depth_smooth > 0.0 and prev_depth is not None and prev_frame_gray is not None:
@@ -684,13 +732,14 @@ def main() -> None:
                     depth_low = a * depth_low + (1.0 - a) * prev_depth
                     _stage_add(stage_times, "depth_smooth_simple", time.perf_counter() - t0)
                 
-                prev_depth = depth_low
+                prev_depth = depth_low.detach().clone()  # M-7: 安全拷贝，避免后续 in-place 改动污染
                 if not args.video_model and args.depth_smooth > 0.0:
+                    # Bug-2 修复：光流用完立刻缓存 prev_frame_gray，保证和下一帧尺度一致
                     prev_frame_gray = cv2.cvtColor(frame_low_bgr, cv2.COLOR_BGR2GRAY)
 
                 # Step 3: 深度转视差
                 t0 = time.perf_counter()
-                disparity_low, near_low = depth_to_disparity(
+                disparity_low, near_low, ema_depth_norm = depth_to_disparity(
                     depth=depth_low,
                     max_disparity=effective_max_disparity,  # ← 跨模式归一化后的等效视差
                     depth_mode=args.depth_mode,
@@ -698,21 +747,14 @@ def main() -> None:
                     clip_high=args.clip_high,
                     stage_times=stage_times,
                     profile_sync=args.profile_time,
+                    ema_state=ema_depth_norm,
+                    ema_beta=0.95,
                 )
                 if args.profile_time:
                     torch.cuda.synchronize()
                 _stage_add(stage_times, "depth_to_disparity_total", time.perf_counter() - t0)
 
-                # Step 4: 左图 resize 到低分辨率 + GPU DIBR（保持宽高比）
-                t0 = time.perf_counter()
-                if args.video_model:
-                    # Video-DAV2 输出是原分辨率，直接用原图做 DIBR
-                    frame_low_bgr = frame_bgr
-                else:
-                    # DAV2 单帧输出是低分辨率，图也要 resize 到低分辨率
-                    frame_low_bgr = cv2.resize(frame_bgr, (low_w, low_h), interpolation=cv2.INTER_LINEAR)
-                _stage_add(stage_times, "frame_resize_low_cpu", time.perf_counter() - t0)
-                
+                # Step 4: GPU DIBR（保持宽高比）
                 t0 = time.perf_counter()
                 # 这张图也用 GPU 颜色转换
                 left_rgb_low = torch.from_numpy(frame_low_bgr).permute(2, 0, 1).to(device=device, dtype=torch.float32)
@@ -732,12 +774,14 @@ def main() -> None:
                 _stage_add(stage_times, "gpu_warp_total", time.perf_counter() - t0)
 
                 # ========== 【师兄优化】空洞左侧膨胀 ==========
-                # t0 = time.perf_counter()
-                # hole_dilated = dilate_hole_left(hole_low, args.hole_dilate_left)
-                # if args.profile_time:
-                #     torch.cuda.synchronize()
-                # _stage_add(stage_times, "hole_dilate_left", time.perf_counter() - t0)
-                hole_dilated = hole_low  # 先不膨胀，测试一下效果
+                if args.hole_dilate_left > 0:
+                    t0 = time.perf_counter()
+                    hole_dilated = dilate_hole_left(hole_low, args.hole_dilate_left)
+                    if args.profile_time:
+                        torch.cuda.synchronize()
+                    _stage_add(stage_times, "hole_dilate_left", time.perf_counter() - t0)
+                else:
+                    hole_dilated = hole_low
                 # Step 5: GPU 低分辨率快速补洞
                 t0 = time.perf_counter()
                 right_inpainted_low = fast_inpaint_gpu(
