@@ -1,11 +1,10 @@
 # 2D 转 3D 立体视频生成
 
-**DepthAnythingV2 + [可选 NVDS 时序稳定] + GPU DIBR + FastInpaint** —— 单目视频转高质量立体视频
+**DepthAnythingV2 / Video-Depth-Anything + Plan A-E 五重时序稳定 + GPU DIBR + FastInpaint** —— 单目视频转高质量立体视频
 
-> ✅ **三种时序一致性方案可选**：
-> 1. 光流后处理平滑
-> 2. Video-Depth-Anything 视频模型（内置时序）
-> 3. **NVDS 深度稳定器**（新增！）
+> ✅ **两种方案可选：
+> 1. 单帧模型 + Plan A-E 五重时序稳定（推荐，无需额外权重）
+> 2. Video-Depth-Anything 视频模型（官方流式推理）
 
 ---
 
@@ -13,9 +12,9 @@
 
 | 问题 | 解决前 | 解决后 |
 |------|--------|--------|
-| **深度抖动** | 帧间深度跳变，闪烁严重 | ✅ 时序一致，平滑过渡 |
+| **深度抖动** | 帧间深度跳变，闪烁严重 | ✅ 五重时序稳定，丝滑过渡 |
 | **拉伸变形** | 强制正方形，画面拉伸 | ✅ 保持宽高比，无变形 |
-| **运动边缘闪烁** | 物体运动时深度突变 | 🚧 NVDS 优化中 |
+| **前景边缘** | 被背景侵蚀 | ✅ 空洞左侧膨胀保护 |
 
 ---
 
@@ -23,164 +22,113 @@
 
 | 文件 | 深度模型 | 时序一致性 | 速度 | 推荐度 |
 |------|----------|------------|------|--------|
-| `mono23d.py` | DepthAnythingV1 单帧 | ❌ 无 | 慢 | ❌ 旧版 |
-| `mono2stereo_lower_fastinpaint_time_gpu.py` | DepthAnythingV2 单帧 | ✅ 光流对齐后处理 | 快 | ⭐⭐⭐ |
-| `mono2stereo_lower_fastinpaint_time_gpu_video.py` | **Video-Depth-Anything** | ✅✅ 模型级原生时序 | 中 | ⭐⭐⭐⭐⭐ 推荐 |
-| **`mono2stereo_with_nvds.py`** | **DAv2/VDA + NVDS 稳定** | ✅✅✅ 三层时序优化 | 较慢 | ⭐⭐⭐ 实验性 |
+| `mono2stereo_video_better_111.py | DepthAnythingV2 / Video-Depth-Anything | ✅✅✅✅✅ Plan A-E 五重时序稳定 | 快 | ⭐⭐⭐⭐⭐ **推荐** |
 
 ---
 
 ## 🚀 快速开始
 
-### 🆕 方式0：开启 NVDS 时序深度稳定（最新！实验性）
-
-在深度推理后插入 NVDS 时序稳定网络，用当前帧 + 历史 3 帧共同优化当前深度。**可以和视频模型/单帧模型同时开启！**
+### 方式1：单帧模型 + Plan A-E 五重时序稳定（推荐）
 
 ```bash
-python mono2stereo_with_nvds.py \
-  --video-path your_video.mp4 \
-  --output output_3d_nvds.mp4 \
+python mono2stereo_video_better_111.py \
+  --video-path test_video.mp4 \
+  --output output_3d.mp4 \
   --encoder vits \
   --input-size 518 \
-  --max-disparity 16 \
+  --dibr-size 1080 \
+  --max-disparity 20 \
   --fp16 \
-  --enable-nvds  # ← ✅ 开启 NVDS 时序稳定
+  --depth-smooth 0.6 \
+  --quantile-smooth 0.8 \
+  --rgb-motion-sigma 0.1 \
+  --flow-align \
+  --flow-height 144 \
+  --median-window 3
 ```
 
-**可以和视频模型叠加使用（双重时序优化）**：
-```bash
-python mono2stereo_with_nvds.py \
-  --video-path your_video.mp4 \
-  --output output_3d_double.mp4 \
-  --encoder vits \
-  --input-size 518 \
-  --max-disparity 16 \
-  --fp16 \
-  --video-model \   # 视频模型做第一层时序
-  --enable-nvds     # NVDS 做第二层时序稳定（双重！）
-```
+**Plan A-E 参数说明**：
+- `--depth-smooth 0.6` (Plan B+C): near 空间 EMA 强度（0~1，越大越平滑）
+- `--quantile-smooth 0.8` (Plan A): 分位数 EMA 强度（消除整帧尺度漂移）
+- `--rgb-motion-sigma 0.1` (Plan B): RGB 运动敏感度（越小越敏感）
+- `--flow-align` (Plan D): 启用光流对齐 Motion-aligned EMA
+- `--flow-height 144`: 光流计算分辨率高度（144 推荐，速度精度平衡）
+- `--median-window 3` (Plan E): 滑窗中值窗口大小（3 推荐）
 
 ---
 
-### 方式1：视频模型模式（推荐，原生时序一致性）
-
-Video-Depth-Anything 官方流式推理，模型训练时就注入时序监督：
+### 方式2：Video-Depth-Anything 视频模型
 
 ```bash
-python mono2stereo_with_nvds.py \
-  --video-path your_video.mp4 \
+python mono2stereo_video_better_111.py \
+  --video-path test_video.mp4 \
   --output output_3d.mp4 \
   --encoder vits \
   --input-size 518 \
-  --max-disparity 16 \
+  --max-disparity 20 \
   --fp16 \
-  --video-model  # ← 开启视频模型
-```
-
-### 方式2：单帧 + 光流平滑（无额外权重）
-
-用普通 DepthAnythingV2 单帧模型 + 光流对齐平滑：
-
-```bash
-python mono2stereo_with_nvds.py \
-  --video-path your_video.mp4 \
-  --output output_3d.mp4 \
-  --encoder vits \
-  --input-size 518 \
-  --max-disparity 16 \
-  --fp16 \
-  --depth-smooth 0.3  # ← 开启光流平滑，建议 0.2~0.5
-```
-
-### 性能分析模式
-
-添加 `--profile-time` 查看各阶段耗时：
-
-```bash
-python mono2stereo_with_nvds.py \
-  --video-path your_video.mp4 \
-  --output output_3d.mp4 \
-  --encoder vits \
-  --input-size 518 \
-  --max-disparity 16 \
-  --fp16 \
-  --profile-time  # ← 打印性能分析
+  --video-model
 ```
 
 ---
 
 ## ⚙️ 参数说明
 
+### 核心参数
+
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| **基础参数** | | |
-| `--video-path` | 输入视频路径、目录或 txt 列表 | ✅ 必填 |
-| `--output` | 输出视频路径（单文件模式） | `./output.mp4` |
-| `--input-size` | 深度模型长边像素（必须 14 倍数） | 518 |
-| `--encoder` | 模型规模: `vits` / `vitb` / `vitl` | vits |
-| `--max-disparity` | 低分辨率下最大视差像素（控制 3D 强度） | 16.0 |
-| `--fp16` | 启用 FP16 推理（速度提升 30%+） | ❌ |
-| **时序一致性** | | |
-| `--video-model` | 使用 Video-Depth-Anything 视频模型（内置时序） | ❌ |
-| `--metric` | 视频模型使用 Metric 深度（需要对应权重） | ❌ |
-| `--depth-smooth` | 光流时序平滑强度（单帧模式用，0=关闭） | 0.0 |
-| `--enable-nvds` | 🆕 **开启 NVDS 时序深度稳定** | ❌ |
-| `--nvds-seq-len` | NVDS 参考序列帧数 | 4 |
-| `--nvds-ckpt` | NVDS 模型权重路径 | `./submodules/NVDS/NVDS_checkpoints/NVDS_Stabilizer.pth` |
-| **输出控制** | | |
-| `--layout` | 立体布局: `sbs` 并排 / `ou` 上下 / `overlay` 重合 | sbs |
-| `--profile-time` | 输出各阶段耗时统计 | ❌ |
+| `--video-path` | 输入视频路径/目录/txt | ✅ 必填 |
+| `--output` | 输出视频路径（单文件） | `./output.mp4` |
+| `--input-size` | 深度模型分辨率长边（必须 14 倍数） | 518 |
+| `--dibr-size` | DIBR 渲染分辨率高度（-1=原分辨率） | -1 |
+| `--encoder` | 模型规模: `vits`/`vitb`/`vitl` | vits |
+| `--max-disparity` | 原分辨率最大视差像素（3D 强度） | 16.0 |
+| `--fp16` | 启用 FP16 推理（快 30%+） | ❌ |
+
+### Plan A-E 时序稳定（仅单帧模式）
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--depth-smooth` | Plan B+C: near 空间 EMA 强度 | 0.6 |
+| `--quantile-smooth` | Plan A: 分位数 EMA 强度 | 0.8 |
+| `--rgb-motion-sigma` | Plan B: RGB 运动敏感度 | 0.1 |
+| `--flow-align` | Plan D: 启用光流对齐 Motion-aligned EMA | ❌ |
+| `--flow-height` | Plan D: 光流计算分辨率高度 | 144 |
+| `--median-window` | Plan E: 滑窗中值窗口大小（1/3/5/7） | 1 |
+
+### DIBR & 补洞
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--hole-dilate-left` | 空洞左侧膨胀像素（保护前景边缘） | 0 |
+| `--fast-kernel` | FastInpaint 邻域核大小 | 7 |
+| `--fast-max-iter` | FastInpaint 最大迭代次数 | 64 |
+
+### 输出 & 编码
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--layout` | 立体布局: `sbs` 并排 / `ou` 上下 / `anaglyph` 红青 / `overlay` 重合 | sbs |
+| `--nvenc-preset` | NVENC 编码预设 | p4 |
+| `--nvenc-cq` | NVENC CQ 质量（越小质量越高） | 19 |
+| `--profile-time` | 打印各阶段耗时统计 | ❌ |
 
 ---
 
-## 🧪 NVDS 集成说明（实验性）
+## 🎯 Plan A-E 五重时序稳定详解
 
-### 架构设计
 ```
-输入视频帧
-    ↓
-[DAv2 单帧 / VDA 视频模型]  # 第一层：原始深度估计
-    ↓
-[NVDS 时序稳定网络]        # 第二层：利用帧间相关性平滑深度（可选）
-    ↓
-深度 → 视差转换
-    ↓
-DIBR 像素重投影 + 补洞
-    ↓
-3D 视频输出
+原始深度 → [Plan A: 分位数 EMA] → [Plan C: near 空间] → [Plan D: 光流对齐] → [Plan B: RGB 引导自适应 EMA] → [Plan E: 滑窗中值] → 稳定深度
 ```
 
-### 当前状态（2026-05-09）
-| 状态 | 说明 |
-|------|------|
-| ✅ 代码跑通 | 可以端到端推理，无 mmcv 依赖 |
-| ✅ 模型可以加载 | 权重可以正常载入 |
-| ⚠️ 只测试了 6 帧 | 长视频还没测 |
-| 🔴 **效果很差** | 深度看起来完全不对，估计和权重/训练有关 |
-
-### 可能的问题
-1. **权重不匹配**：原 NVDS 是在 MiDaS/DPT 上训练的，现在换成 DepthAnythingV2，深度分布不一致，直接迁移效果差
-2. **输入归一化问题**：DAv2 和原深度模型的输出分布范围不同，NVDS 模型可能需要重新训练
-3. **帧填充策略**：前几帧用反向填充，可能影响初期效果
-
-### 下一步计划
-- [ ] 对比原 NVDS 官方推理脚本输出，确认深度分布是否一致
-- [ ] 在 DAv2 上微调 NVDS 稳定器（需要标注时序视频深度）
-- [ ] 对比：光流平滑 vs 视频模型 vs NVDS 三种时序方案的效果差异
-
----
-
-## 💡 3D 强度调整
-
-主要调 `--max-disparity` 参数：
-
-| 值 | 效果 | 适用场景 |
-|----|------|----------|
-| 8~12 | 浅 3D，出屏效果弱 | 纪录片、风景 |
-| **16** | 平衡，默认推荐 | 一般视频 |
-| 20~24 | 强 3D，出屏明显 | 人物特写、动画 |
-
-> 提示：不要超过 32，否则会有明显伪影
+| 方案 | 作用 | 耗时 |
+|------|------|------|
+| **Plan A** | 消除整帧尺度/偏移漂移（随机采样 16k 像素，几乎零开销） | ~0.1ms |
+| **Plan B** | RGB 引导逐像素自适应平滑（静止区强平滑，运动区不平滑，无 ghosting） | ~0.5ms |
+| **Plan C** | 平滑在归一化后的 near 空间（与渲染量直接相关） | ~0.05ms |
+| **Plan D** | 光流对齐 Motion-aligned EMA（低分辨率 Farneback） | ~1~3ms |
+| **Plan E** | 滑窗逐像素中值（抗单帧极值噪声） | ~0.3ms |
 
 ---
 
@@ -190,16 +138,14 @@ DIBR 像素重投影 + 补洞
 
 | 模式 | FPS | 说明 |
 |------|-----|------|
-| 单帧模型（无平滑） | ~20 | 速度最快 |
-| 单帧模型 + 光流平滑 | ~17 | + 几毫秒光流计算 |
-| VDA 视频模型 | ~12 | 模型自带时序注意力，效果最好 |
-| **单帧 + NVDS** | ~8 | 额外加一次 NVDS 推理 |
-| **VDA + NVDS** | ~5 | 双重时序稳定，最慢 |
+| 单帧模型 + Plan A-E（input=518, dibr=1080) | ~25 FPS | 推荐配置 |
+| 单帧模型 + Plan A-E（input=518, dibr=-1) | ~18 FPS | 全分辨率渲染 |
+| Video-Depth-Anything 视频模型 | ~12 FPS | 官方流式推理 |
 
 性能瓶颈：
 - 🔴 深度推理（最耗时）
-- 🟡 NVDS 时序稳定推理
-- 🟢 DIBR 像素重投影 + 补洞
+- 🟡 Plan D 光流对齐（可选）
+- 🟢 DIBR + 补洞
 
 ---
 
@@ -218,21 +164,13 @@ checkpoints/depth_anything_v2_vitl.pth
 checkpoints/video_depth_anything_vits.pth
 checkpoints/video_depth_anything_vitb.pth
 checkpoints/video_depth_anything_vitl.pth
-checkpoints/metric_video_depth_anything_vits.pth  # Metric 版本
+checkpoints/metric_video_depth_anything_vits.pth
 ```
 下载地址：https://github.com/DepthAnything/Video-Depth-Anything
-
-### NVDS 时序稳定模型
-```
-submodules/NVDS/NVDS_checkpoints/NVDS_Stabilizer.pth
-```
-下载地址：https://github.com/baidu-research/NVDS
 
 ---
 
 ## 🔧 环境依赖
-
-**一个环境就能跑！不需要 mmcv！** 🎉
 
 ```bash
 pip install torch opencv-python numpy torchvision einops timm matplotlib
@@ -244,31 +182,42 @@ ffmpeg（需要支持 h264_nvenc）：
 sudo apt install ffmpeg
 ```
 
-### 已移除的依赖
-✅ ~~mmcv~~ （完全用纯 PyTorch 重写了 Registry / 权重加载 / 工具函数）  
-✅ ~~mmseg~~  
-✅ ~~attrs~~ （调试遗留，已删除）  
-✅ ~~IPython.embed~~ （调试遗留，已删除）
+---
+
+## 💡 3D 强度调整
+
+主要调 `--max-disparity` 参数：
+
+| 值 | 效果 | 适用场景 |
+|----|------|----------|
+| 8~12 | 浅 3D，出屏效果弱 | 纪录片、风景 |
+| **16~20** | 平衡，推荐 | 一般视频 |
+| 20~30 | 强 3D，出屏明显 | 人物特写、动画 |
+
+> 提示：不要超过 40，否则会有明显伪影
 
 ---
 
 ## 🎯 技术亮点
 
-### 1. ✅ 保持宽高比
-- 不再强制正方形，自动根据原视频比例计算目标尺寸
-- 确保两个维度都是 14 的倍数（DAv2 要求）
-- NVDS 自动 pad 到 32 倍数，推理完裁剪回来
+### 1. ✅ Plan A-E 五重时序稳定
+- 全在深度推理分辨率完成，几乎不影响速度
+- Plan A 分位数 EMA 消除整帧漂移
+- Plan B RGB 引导避免 ghosting
+- Plan D 光流对齐 Motion-aligned
+- Plan E 中值滤波抗噪
 
-### 2. ✅ 三层时序一致性方案可选
+### 2. ✅ 双分辨率 Pipeline
+- 深度推理：低分辨率（快）
+- DIBR 渲染：高分辨率（质量好）
+- 一次 GPU 上传，同时生成双分辨率
 
-| 方案 | 优点 | 缺点 |
-|------|------|------|
-| **光流对齐后处理** | 无额外权重，速度快，即插即用 | 大运动场景光流不准 |
-| **Video-Depth-Anything** | 原生级一致性，运动场景也不糊 | 需要额外视频模型权重 |
-| **NVDS 时序稳定** | 专门为深度时序稳定设计 | 目前效果差，需要重新训练 |
+### 3. ✅ int64 无损 Z-buffer
+- 彻底解决像素冲突伪影
+- 前景永远在背景前面
 
-### 3. ✅ 全 GPU 加速
-- 预处理（Resize + Normalize）全部在 GPU
+### 4. ✅ 全 GPU 加速
+- 预处理（Resize + Normalize）全 GPU
 - BGR→RGB 颜色转换 GPU 加速
 - DIBR 像素重投影 GPU 并行
 - FastInpaint 补洞 GPU 卷积
@@ -277,16 +226,6 @@ sudo apt install ffmpeg
 ---
 
 ## 🐛 常见问题
-
-### Q: 报错 `ModuleNotFoundError: No module named '...'`
-```bash
-pip install einops timm matplotlib
-```
-
-### Q: NVDS 深度效果完全不对
-已知问题！目前直接把在 MiDaS 上训练的 NVDS 权重迁移到 DAv2，深度分布不一致，效果很差。需要：
-1. 要么微调 NVDS 权重适配 DAv2
-2. 要么把 DAv2 深度归一化到和 MiDaS 一样的分布
 
 ### Q: 3D 效果太强/太弱
 调 `--max-disparity`：
@@ -299,45 +238,31 @@ pip install einops timm matplotlib
 return np.concatenate([right_u8, left_u8], axis=1)
 ```
 
----
+### Q: 前景边缘被背景侵蚀
+增加 `--hole-dilate-left` 参数：
+- 比如 `--hole-dilate-left 3` 或 `5`
 
-## 📄 项目结构
-
-```
-2Dto3D/
-├── mono2stereo_with_nvds.py                    # ✅ 最新主脚本（支持所有模式）
-├── mono2stereo_lower_fastinpaint_time_gpu_video.py  # 旧版（双模式）
-├── README.md                                    # ✅ 本文件
-├── checkpoints/                                 # 模型权重目录
-│   ├── depth_anything_v2_vits.pth
-│   └── video_depth_anything_vits.pth
-└── submodules/
-    ├── depth/dav2/                              # DepthAnythingV2
-    ├── Video_Depth_Anything/                    # Video-Depth-Anything
-    └── NVDS/                                     # 🆕 NVDS 时序稳定器
-        ├── NVDS_checkpoints/NVDS_Stabilizer.pth
-        ├── full_model.py
-        └── ...
-```
+### Q: 闪烁还是比较严重
+增强时序稳定：
+- 增加 `--depth-smooth` 到 0.7~0.8
+- 增加 `--quantile-smooth` 到 0.9
+- 启用 `--flow-align`
+- 设置 `--median-window 3`
 
 ---
 
 ## 📝 更新日志
 
-### v2.1 (2026-05-09)
-- ✅ **新增 NVDS 时序深度稳定集成**
-- ✅ `--enable-nvds` 开关，默认关闭（零性能影响）
-- ✅ 支持与 `--video-model` 同时开启（双重时序优化）
-- ✅ 彻底移除 NVDS 的 mmcv / mmseg 依赖（纯 PyTorch）
-- ✅ 自动分辨率适配：14 倍数 → 32 倍数 → 裁剪回原尺寸
-- ⚠️ 目前效果较差，需要进一步调优/微调
+### v3.0（最新）
+- ✅ **Plan A-E 五重时序稳定**（替代 NVDS）
+- ✅ **深度推理 & DIBR 渲染分辨率彻底解耦**（--dibr-size）
+- ✅ 性能优化：inpaint kernel 缓存、随机 16k 像素 quantile
+- ✅ 全 GPU 双分辨率预处理 pipeline
+- ✅ 移除 NVDS 相关代码（效果不佳且需要重训）
 
-### v2.0 (2026-04-23)
+### v2.0
 - ✅ 集成 Video-Depth-Anything 官方视频模型
-- ✅ 流式推理 API，模型内部维护时序状态
-- ✅ 单帧模式升级：简单平滑 → 光流对齐 + 平滑
-- ✅ 自动保持宽高比，不再强制正方形
-- ✅ 完善 --profile-time 性能统计
+- ✅ 保持宽高比
 
 ### v1.5
 - ✅ 全 GPU 预处理加速
@@ -346,4 +271,5 @@ return np.concatenate([right_u8, left_u8], axis=1)
 
 ---
 
-**NVDS 目前效果还有问题，欢迎一起调优！先把视频模型用起来效果就很好了！** 😎
+**推荐用单帧模型 + Plan A-E 五重时序稳定，无需额外权重，效果好速度快！** 😎
+
