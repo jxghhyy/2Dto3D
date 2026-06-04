@@ -1,0 +1,14 @@
+../../dataset/shuai/Huawei/badminton.mp4
+../../dataset/shuai/Huawei/cartoon_fight.mp4
+#../../dataset/shuai/Huawei/cartoon_nezha.mkv
+#../../dataset/shuai/Huawei/CBA.mp4
+../../dataset/shuai/Huawei/CL.mp4
+../../dataset/shuai/Huawei/football.mp4
+../../dataset/shuai/Huawei/KuangFu.mkv
+#../../dataset/shuai/Huawei/NBA.mp4
+#../../dataset/shuai/Huawei/Real_Madrid.mp4
+../../dataset/shuai/Huawei/spider.mp4
+../../dataset/shuai/Huawei/table_tennis.mp4
+../../dataset/shuai/Huawei/tennis_ball.mp4
+#../../dataset/shuai/Huawei/The_Wandering_Earth.mp4
+../../dataset/shuai/Huawei/volleyball.mp4

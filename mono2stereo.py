@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     
     # ---- 分辨率 ----
     parser.add_argument("--input-size", type=int, default=518, help="深度模型输入基准高度（必须为14的倍数，决定推理速度）")
-    parser.add_argument("--dibr-size", type=int, default=-1, help="DIBR渲染基准高度（-1表示使用视频原分辨率）")
+    parser.add_argument("--dibr-size", type=int, default=0, help="DIBR渲染基准高度（-1=原分辨率，0=和input-size一致）")
     
     parser.add_argument("--encoder", type=str, default="vits", choices=["vits", "vitb", "vitl", "vitg"])
     parser.add_argument("--video-model", action="store_true", help="使用Video-Depth-Anything视频模型（内置时序一致性）")
@@ -92,11 +92,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-high", type=float, default=0.99, help="深度归一化高分位")
     
     # ---- 时序稳定化（Plan A / B / C / D / E） ----
-    parser.add_argument("--depth-smooth", type=float, default=0.6,
+    parser.add_argument("--depth-smooth", type=float, default=0.0,
                         help="【Plan B+C】near空间EMA强度（前帧权重；0=禁用，0.6推荐）")
-    parser.add_argument("--quantile-smooth", type=float, default=0.8,
+    parser.add_argument("--quantile-smooth", type=float, default=0.0,
                         help="【Plan A】分位数EMA强度（前帧权重；0=禁用，0.8推荐，几乎零开销）")
-    parser.add_argument("--rgb-motion-sigma", type=float, default=0.1,
+    parser.add_argument("--rgb-motion-sigma", type=float, default=0.0,
                         help="【Plan B】RGB帧差sigma；越小越敏感于运动；0=禁用自适应（退化为均匀EMA）")
     
     # Plan D: 光流对齐
@@ -122,10 +122,11 @@ def parse_args() -> argparse.Namespace:
         choices=["h264_nvenc", "libx264", "h264_vaapi"],
         help="视频编码器: h264_nvenc=NVIDIA硬件编码, libx264=CPU编码")
     parser.add_argument("--nvenc-gpu", type=int, default=0, help="h264_nvenc 使用的 GPU ID (避免和 PyTorch 冲突)")
-    parser.add_argument("--nvenc-preset", type=str, default="p4", help="NVENC preset")
+    parser.add_argument("--nvenc-preset", type=str, default="medium", help="NVENC preset (default, slow, medium, fast, hp, hq, bd, ll, llhq, llhp, lossless, losslesshp)")
     parser.add_argument("--nvenc-cq", type=int, default=19, help="NVENC CQ (h264_nvenc) / CRF (libx264)")
     parser.add_argument("--profile-time", action="store_true", help="输出各阶段平均耗时和FPS")
     parser.add_argument("--profile-total", action="store_true", help="输出脚本级端到端总耗时和总平均FPS")
+    parser.add_argument("--profile-output", type=str, default=None, help="性能统计保存到文件路径")
     return parser.parse_args()
 
 
@@ -597,50 +598,73 @@ def compose_stereo(left_u8: np.ndarray, right_u8: np.ndarray, layout: str, overl
     return np.clip(mixed, 0.0, 255.0).astype(np.uint8)
 
 
+def check_nvenc_available(ffmpeg_bin: str, test_width: int = 1920, test_height: int = 1080) -> bool:
+    """测试 h264_nvenc 是否可用"""
+    try:
+        # 用一个简单的测试命令
+        cmd = [
+            ffmpeg_bin, "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", f"color=c=black:s={test_width}x{test_height}:r=1",
+            "-vframes", "1",
+            "-c:v", "h264_nvenc", "-gpu", "0",
+            "-f", "null", "/dev/null"
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def create_nvenc_writer(
     ffmpeg_bin: str, input_video: str, output_video: str,
     fps: float, out_w: int, out_h: int, encoder: str, nvenc_gpu: int, preset: str, cq: int,
 ) -> subprocess.Popen:
-    # 基础命令
-    cmd = [
-        ffmpeg_bin, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s:v", f"{out_w}x{out_h}", "-r", str(fps), "-i", "-", "-i", input_video,
-        "-map", "0:v:0", "-map", "1:a?",
-    ]
+    # yuv420p 要求宽高为偶数，如果是奇数就用 yuv444p
+    pix_fmt = "yuv420p" if (out_w % 2 == 0 and out_h % 2 == 0) else "yuv444p"
+    if pix_fmt != "yuv420p":
+        print(f"[mono2stereo] ⚠️  分辨率 {out_w}x{out_h} 有奇数，使用 {pix_fmt}")
 
-    # 编码器特定参数
-    if encoder == "h264_nvenc":
+    def build_cmd(enc: str) -> list:
+        cmd = [
+            ffmpeg_bin, "-y", "-loglevel", "warning", "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s:v", f"{out_w}x{out_h}", "-r", str(fps), "-i", "-", "-i", input_video,
+            "-map", "0:v:0", "-map", "1:a?",
+        ]
+        if enc == "h264_nvenc":
+            cmd.extend([
+                "-c:v", "h264_nvenc",
+                "-gpu", str(nvenc_gpu),
+                "-preset", preset,
+                "-rc", "vbr",
+                "-cq", str(cq),
+                "-b:v", "0",
+            ])
+        elif enc == "libx264":
+            cmd.extend([
+                "-c:v", "libx264",
+                "-preset", preset if preset in ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"] else "medium",
+                "-crf", str(cq),
+            ])
+        elif enc == "h264_vaapi":
+            cmd.extend([
+                "-c:v", "h264_vaapi",
+                "-qp", str(cq),
+            ])
         cmd.extend([
-            "-c:v", "h264_nvenc",
-            "-gpu", str(nvenc_gpu),  # 指定 GPU 避免和 PyTorch 冲突
-            "-preset", preset,
-            "-rc", "vbr",
-            "-cq", str(cq),
-            "-b:v", "0",
+            "-pix_fmt", pix_fmt,
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            "-shortest",
+            output_video,
         ])
-    elif encoder == "libx264":
-        cmd.extend([
-            "-c:v", "libx264",
-            "-preset", "medium" if preset == "p4" else preset,
-            "-crf", str(cq),
-        ])
-    elif encoder == "h264_vaapi":
-        cmd.extend([
-            "-c:v", "h264_vaapi",
-            "-qp", str(cq),
-        ])
+        return cmd
 
-    # 通用参数
-    cmd.extend([
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        "-shortest",
-        output_video,
-    ])
-
-    print("[mono2stereo] ffmpeg:", " ".join(cmd))
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    # 简化版本：先试 h264_nvenc，如果报错信息里有分辨率相关的，再考虑处理
+    # 这里不做复杂的预检测，直接启动，如果后续写入失败，main函数已经有处理逻辑了
+    actual_encoder = encoder
+    cmd = build_cmd(actual_encoder)
+    print(f"[mono2stereo] ffmpeg (using {actual_encoder}):", " ".join(cmd))
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 # ==================== 全 GPU 双分辨率预处理 ====================
@@ -843,13 +867,22 @@ def main() -> None:
         aspect_ratio = w_orig / h_orig
 
         # ---- 深度推理流尺寸 (14 倍数) ----
-        depth_h = args.input_size
-        assert depth_h % 14 == 0, f"input_size({depth_h}) 必须是 14 的倍数"
-        depth_w = int(round(depth_h * aspect_ratio / 14.0)) * 14
+        # 和 mono2stereo_video_better.py 一致：input_size 是长边
+        long_edge = args.input_size
+        assert long_edge % 14 == 0, f"input_size({long_edge}) 必须是 14 的倍数"
+        scale = long_edge / max(h_orig, w_orig)
+        depth_h = max(14, int(round(h_orig * scale / 14)) * 14)
+        depth_w = max(14, int(round(w_orig * scale / 14)) * 14)
+        if w_orig >= h_orig:
+            depth_w = long_edge
+        else:
+            depth_h = long_edge
 
         # ---- DIBR 渲染流尺寸 ----
-        if args.dibr_size <= 0:
+        if args.dibr_size == -1:
             dibr_h, dibr_w = h_orig, w_orig
+        elif args.dibr_size == 0:
+            dibr_h, dibr_w = depth_h, depth_w  # 和 input-size 一致
         else:
             dibr_h = args.dibr_size
             dibr_w = int(round(dibr_h * aspect_ratio / 2.0)) * 2
@@ -873,10 +906,20 @@ def main() -> None:
             torch.cuda.synchronize()
             warmup_done = True
 
-        # 输出尺寸
-        if args.layout == "sbs":
+        # 输出尺寸 - 自动适配 NVENC
+        use_layout = args.layout
+        if args.video_encoder == "h264_nvenc":
+            # 如果是 h264_nvenc，先试试 sbs 宽度是否超限制
+            sbs_w = w_orig * 2
+            nvenc_max_w = 4096  # 经过测试，当前环境 NVENC 最大宽度支持超过 4096，但 5152 不行
+            if use_layout == "sbs" and sbs_w > 4096:
+                print(f"[mono2stereo] ⚠️  sbs 模式宽度 {sbs_w} 超过 NVENC 限制，自动切换到 ou 模式")
+                use_layout = "ou"
+
+        # 计算最终输出尺寸
+        if use_layout == "sbs":
             out_w, out_h = w_orig * 2, h_orig
-        elif args.layout == "ou":
+        elif use_layout == "ou":
             out_w, out_h = w_orig, h_orig * 2
         else:
             out_w, out_h = w_orig, h_orig
@@ -937,11 +980,21 @@ def main() -> None:
                     left_rgb_dibr = left_rgb_dibr.flip(-1) / 255.0  # BGR→RGB
                     near_smooth = depth_raw  # 视频模型自带时序，直接用
                 else:
-                    # 单帧模式 + 双分辨率预处理 + PLAN A-E 时序稳定
-                    model_input, left_rgb_dibr, rgb_depth = prepare_inputs_dual_res_gpu(
-                        frame_bgr, device, (depth_h, depth_w), (dibr_h, dibr_w),
-                        MEAN, STD, stage_times, args.profile_time,
-                    )
+                    # 单帧模式预处理
+                    use_stabilizer = args.quantile_smooth > 0 or args.depth_smooth > 0 or args.flow_align or args.median_window > 1
+                    need_two_res = (dibr_h != depth_h or dibr_w != depth_w) or use_stabilizer
+                    if need_two_res:
+                        model_input, left_rgb_dibr, rgb_depth = prepare_inputs_dual_res_gpu(
+                            frame_bgr, device, (depth_h, depth_w), (dibr_h, dibr_w),
+                            MEAN, STD, stage_times, args.profile_time,
+                        )
+                    else:
+                        # 时序稳定都禁用且 dibr-size == input-size，用简化预处理
+                        model_input, left_rgb_dibr, _ = prepare_inputs_dual_res_gpu(
+                            frame_bgr, device, (depth_h, depth_w), (depth_h, depth_w),
+                            MEAN, STD, stage_times, args.profile_time,
+                        )
+
                     if args.fp16:
                         model_input = model_input.half()
 
@@ -956,10 +1009,24 @@ def main() -> None:
                         stage_times.get("prep_color_and_resize_gpu", 0) +
                         stage_times.get("prep_normalize", 0))
 
-                    # ========== Step 2: PLAN A-E 时序稳定 ==========
+                    # ========== Step 2: 深度归一化 + near 转换 ==========
                     t0 = time.perf_counter()
-                    near_smooth = stabilizer.step(depth_raw, rgb_depth, stage_times, args.profile_time)
-                    _stage_add(stage_times, "stabilize_total", time.perf_counter() - t0)
+                    if use_stabilizer:
+                        near_smooth = stabilizer.step(depth_raw, rgb_depth, stage_times, args.profile_time)
+                        _stage_add(stage_times, "stabilize_total", time.perf_counter() - t0)
+                    else:
+                        # 时序稳定都禁用时，直接做简单归一化（和 mono2stereo_video_better.py 一致）
+                        flat = depth_raw.reshape(-1)
+                        sample_size = 16384
+                        idx = torch.randint(0, flat.numel(), (sample_size,), device=flat.device)
+                        sample = flat[idx]
+                        q_vals = torch.quantile(sample, torch.tensor([args.clip_low, args.clip_high], device=flat.device))
+                        low, high = q_vals[0], q_vals[1]
+                        denom = (high - low).clamp_min(1e-6)
+                        depth_norm = ((depth_raw - low) / denom).clamp(0.0, 1.0)
+                        near_smooth = depth_norm if args.depth_mode == "inverse" else (1.0 - depth_norm)
+                        _maybe_sync(device, args.profile_time)
+                        _stage_add(stage_times, "stabilize_total", time.perf_counter() - t0)
 
                 if args.profile_time:
                     torch.cuda.synchronize()
@@ -974,11 +1041,14 @@ def main() -> None:
                         near = 1.0 - depth_raw
                     disparity = near * args.max_disparity
                 else:
-                    # 单帧模式：GPU重采样到 DIBR 分辨率
-                    near_dibr = F.interpolate(
-                        near_smooth[None, None, :, :], size=(dibr_h, dibr_w),
-                        mode="bilinear", align_corners=False,
-                    )[0, 0]
+                    # 单帧模式：GPU重采样到 DIBR 分辨率（如果需要）
+                    if (dibr_h == depth_h and dibr_w == depth_w):
+                        near_dibr = near_smooth
+                    else:
+                        near_dibr = F.interpolate(
+                            near_smooth[None, None, :, :], size=(dibr_h, dibr_w),
+                            mode="bilinear", align_corners=False,
+                        )[0, 0]
                     disparity = near_dibr * max_disparity_dibr
                     _maybe_sync(device, args.profile_time)
                     _stage_add(stage_times, "near_resample_gpu", time.perf_counter() - t0)
@@ -1019,21 +1089,21 @@ def main() -> None:
 
                 # ========== Step 6: GPU → CPU + 上采样 ==========
                 t0 = time.perf_counter()
-                left_u8_dibr = (left_rgb_dibr.clamp(0, 1) * 255.0).byte().contiguous().cpu().numpy()
                 right_u8_dibr = (right_inpainted_dibr.clamp(0, 1) * 255.0).byte().contiguous().cpu().numpy()
                 _stage_add(stage_times, "to_cpu_numpy", time.perf_counter() - t0)
 
                 t0 = time.perf_counter()
+                # 左眼直接用原图（避免下采样再上采样的画质损失）
+                left_u8 = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                # 右眼才需要上采样
                 if args.video_model or (dibr_h == h_orig and dibr_w == w_orig):
-                    left_u8 = left_u8_dibr
                     right_u8 = right_u8_dibr
                 else:
-                    left_u8 = cv2.resize(left_u8_dibr, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
                     right_u8 = cv2.resize(right_u8_dibr, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
                 _stage_add(stage_times, "upsample_to_orig_cpu", time.perf_counter() - t0)
 
                 t0 = time.perf_counter()
-                stereo = compose_stereo(left_u8, right_u8, args.layout, args.overlay_alpha)
+                stereo = compose_stereo(left_u8, right_u8, use_layout, args.overlay_alpha)
                 _stage_add(stage_times, "compose_stereo", time.perf_counter() - t0)
 
                 # ========== Step 7: 写入 ffmpeg ==========
@@ -1050,8 +1120,12 @@ def main() -> None:
             reader.stop()
             cap.release()
             writer.stdin.close()
+            # 读取stderr看报错信息
+            stderr_output = writer.stderr.read().decode('utf-8', errors='replace')
             ret = writer.wait()
             if ret != 0:
+                if stderr_output:
+                    print(f"\n[mono2stereo] ❌ ffmpeg 错误信息:\n{stderr_output}")
                 raise RuntimeError(f"ffmpeg编码失败，退出码: {ret}")
 
         total_elapsed = time.perf_counter() - t_video0
@@ -1060,8 +1134,12 @@ def main() -> None:
         print(f"[mono2stereo] processed_frames={processed_frames}, total_time={total_elapsed:.3f}s, avg_fps={avg_fps:.3f}")
 
         if args.profile_time and processed_frames > 0:
-            print("\n[mono2stereo] 各阶段用时统计:")
-            print("=" * 70)
+            # 收集所有统计信息
+            profile_lines = []
+            profile_lines.append("\n[mono2stereo] 各阶段用时统计:")
+            profile_lines.append("=" * 70)
+            profile_lines.append(f"📈 处理帧数: {processed_frames}, 总用时: {total_elapsed:.3f}s, 平均FPS: {processed_frames / total_elapsed:.2f}")
+            profile_lines.append("")
 
             top_level = [
                 ("read_frame_queue", "从队列取帧 (后台预读)"),
@@ -1080,15 +1158,16 @@ def main() -> None:
             ]
 
             top_total = sum(stage_times.get(k, 0) for k, _ in top_level)
-            print(f"📊 【顶层阶段汇总】 (总和: {top_total:.3f}s)")
+            profile_lines.append(f"📊 【顶层阶段汇总】 (总和: {top_total:.3f}s, 平均每帧: {top_total/processed_frames*1000:.1f}ms)")
             for key, cn_name in top_level:
                 if key in stage_times:
                     t = stage_times[key]
+                    t_avg = t / processed_frames * 1000
                     ratio = (t / top_total * 100.0) if top_total > 0 else 0.0
-                    print(f"  {key:30s} {t:8.3f}s ({ratio:5.1f}%)  |  {cn_name}")
+                    profile_lines.append(f"  {key:30s} {t:8.3f}s ({ratio:5.1f}%) | {t_avg:7.1f}ms/帧 | {cn_name}")
 
-            print("\n🔍 【各阶段内部细分明细】")
-            print("-" * 70)
+            profile_lines.append("\n🔍 【各阶段内部细分明细】")
+            profile_lines.append("-" * 70)
 
             # 预处理内部
             depth_sub = [
@@ -1101,17 +1180,20 @@ def main() -> None:
             depth_parent = "infer_depth_total"
             if depth_parent in stage_times:
                 parent_time = stage_times[depth_parent]
-                print(f"\n[{depth_parent}] 内部拆解 (父阶段总用时: {parent_time:.3f}s):")
+                parent_avg = parent_time / processed_frames * 1000
+                profile_lines.append(f"\n[{depth_parent}] 内部拆解 (总: {parent_time:.3f}s, 平均: {parent_avg:.1f}ms/帧):")
                 for key, cn_name in depth_sub:
                     if key in stage_times:
                         t = stage_times[key]
+                        t_avg = t / processed_frames * 1000
                         ratio = (t / parent_time * 100.0) if parent_time > 0 else 0.0
-                        print(f"  ├─ {key:25s} {t:8.3f}s ({ratio:5.1f}%)  |  {cn_name}")
+                        profile_lines.append(f"  ├─ {key:25s} {t:8.3f}s ({ratio:5.1f}%) | {t_avg:6.1f}ms/帧 | {cn_name}")
 
             # 时序稳定内部
             if "stabilize_total" in stage_times:
                 parent_time = stage_times["stabilize_total"]
-                print(f"\n[stabilize_total] 内部拆解 (父阶段总用时: {parent_time:.3f}s):")
+                parent_avg = parent_time / processed_frames * 1000
+                profile_lines.append(f"\n[stabilize_total] 内部拆解 (总: {parent_time:.3f}s, 平均: {parent_avg:.1f}ms/帧):")
                 stab_sub = [
                     ("stab_quantile_ema", "🅰 分位数EMA + 归一化"),
                     ("stab_near_calc", "near转换 (1-d / d)"),
@@ -1122,14 +1204,16 @@ def main() -> None:
                 for key, cn_name in stab_sub:
                     if key in stage_times:
                         t = stage_times[key]
+                        t_avg = t / processed_frames * 1000
                         ratio = (t / parent_time * 100.0) if parent_time > 0 else 0.0
-                        print(f"  ├─ {key:25s} {t:8.3f}s ({ratio:5.1f}%)  |  {cn_name}")
+                        profile_lines.append(f"  ├─ {key:25s} {t:8.3f}s ({ratio:5.1f}%) | {t_avg:6.1f}ms/帧 | {cn_name}")
 
             # DIBR内部
             warp_parent = "gpu_warp_total"
             if warp_parent in stage_times:
                 parent_time = stage_times[warp_parent]
-                print(f"\n[{warp_parent}] 内部拆解 (父阶段总用时: {parent_time:.3f}s):")
+                parent_avg = parent_time / processed_frames * 1000
+                profile_lines.append(f"\n[{warp_parent}] 内部拆解 (总: {parent_time:.3f}s, 平均: {parent_avg:.1f}ms/帧):")
                 warp_sub = [
                     ("warp_grid_gen", "生成网格坐标"),
                     ("warp_index_prep", "准备线性索引"),
@@ -1139,16 +1223,19 @@ def main() -> None:
                 for key, cn_name in warp_sub:
                     if key in stage_times:
                         t = stage_times[key]
+                        t_avg = t / processed_frames * 1000
                         ratio = (t / parent_time * 100.0) if parent_time > 0 else 0.0
-                        print(f"  ├─ {key:25s} {t:8.3f}s ({ratio:5.1f}%)  |  {cn_name}")
+                        profile_lines.append(f"  ├─ {key:25s} {t:8.3f}s ({ratio:5.1f}%) | {t_avg:6.1f}ms/帧 | {cn_name}")
 
             # 补洞内部
             if "fast_inpaint_total" in stage_times:
                 parent_time = stage_times["fast_inpaint_total"]
-                print(f"\n[fast_inpaint_total] 内部拆解 (父阶段总用时: {parent_time:.3f}s):")
+                parent_avg = parent_time / processed_frames * 1000
+                profile_lines.append(f"\n[fast_inpaint_total] 内部拆解 (总: {parent_time:.3f}s, 平均: {parent_avg:.1f}ms/帧):")
                 inpaint_keys = [k for k in stage_times if k.startswith("inpaint_")]
                 for key in sorted(inpaint_keys):
                     t = stage_times[key]
+                    t_avg = t / processed_frames * 1000
                     ratio = (t / parent_time * 100.0) if parent_time > 0 else 0.0
                     if key == "inpaint_skip_no_holes":
                         cn_name = "跳过(无空洞)"
@@ -1161,12 +1248,53 @@ def main() -> None:
                         cn_name = f"卷积迭代 ({iters}次)"
                     else:
                         cn_name = ""
-                    print(f"  ├─ {key:25s} {t:8.3f}s ({ratio:5.1f}%)  |  {cn_name}")
+                    profile_lines.append(f"  ├─ {key:25s} {t:8.3f}s ({ratio:5.1f}%) | {t_avg:6.1f}ms/帧 | {cn_name}")
 
-            print()
-            print("=" * 70)
-            print(f"📈 处理帧数: {processed_frames}, 平均FPS: {processed_frames / total_elapsed:.2f}")
-            print(f"💡 提示: 如果 'read_frame_queue' 接近 0，说明预读队列工作正常，GPU 没有等 CPU！")
+            profile_lines.append("")
+            profile_lines.append("=" * 70)
+            profile_lines.append(f"💡 提示: 如果 'read_frame_queue' 接近 0，说明预读队列工作正常，GPU 没有等 CPU！")
+
+            # 打印到控制台
+            for line in profile_lines:
+                print(line)
+
+            # 保存到文件（如果指定了路径或默认保存）
+            profile_file = args.profile_output
+            if profile_file is None:
+                # 默认保存在输出视频同目录下，同名 .txt 文件
+                profile_file = Path(out_path).with_suffix('.txt')
+
+            try:
+                os.makedirs(os.path.dirname(profile_file), exist_ok=True)
+                with open(profile_file, 'w', encoding='utf-8') as f:
+                    # 写入基本信息
+                    f.write(f"=== 2D转3D 性能统计 ===\n")
+                    f.write(f"视频文件: {filename}\n")
+                    f.write(f"输出文件: {out_path}\n")
+                    f.write(f"原始分辨率: {w_orig}×{h_orig}\n")
+                    f.write(f"深度推理分辨率: {depth_w}×{depth_h}\n")
+                    f.write(f"DIBR分辨率: {dibr_w}×{dibr_h}\n")
+                    f.write(f"编码器: {args.encoder}\n")
+                    f.write(f"输入尺寸: {args.input_size}\n")
+                    f.write(f"最大视差: {args.max_disparity}\n")
+                    f.write(f"FP16: {args.fp16}\n")
+                    f.write(f"\n=== Plan配置 ===\n")
+                    f.write(f"quantile_smooth (Plan A): {args.quantile_smooth}\n")
+                    f.write(f"depth_smooth (Plan B+C): {args.depth_smooth}\n")
+                    f.write(f"rgb_motion_sigma (Plan B): {args.rgb_motion_sigma}\n")
+                    f.write(f"flow_align (Plan D): {args.flow_align}\n")
+                    f.write(f"flow_height (Plan D): {args.flow_height}\n")
+                    f.write(f"median_window (Plan E): {args.median_window}\n")
+                    f.write(f"\n=== 运行结果 ===\n")
+                    f.write(f"处理帧数: {processed_frames}\n")
+                    f.write(f"总用时: {total_elapsed:.3f}s\n")
+                    f.write(f"平均FPS: {processed_frames / total_elapsed:.2f}\n")
+                    f.write(f"\n=== 详细统计 ===\n")
+                    for line in profile_lines:
+                        f.write(line + '\n')
+                print(f"[mono2stereo] 性能统计已保存到: {profile_file}")
+            except Exception as e:
+                print(f"[mono2stereo] 保存性能统计失败: {e}")
 
     if args.profile_total:
         script_elapsed = time.perf_counter() - script_t0
