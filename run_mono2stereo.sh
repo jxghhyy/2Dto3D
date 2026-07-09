@@ -12,8 +12,8 @@ OUTPUT=""
 OUTDIR="./output_plan"
 ENCODER="vits"          # vits, vitb, vitl, vitg
 INPUT_SIZE=518          # 深度推理分辨率 (14的倍数)
-DIBR_SIZE=0             # DIBR渲染分辨率 (0=同input-size, -1=原分辨率)
-MAX_DISPARITY=16        # 最大视差
+DIBR_SIZE=294          # DIBR渲染分辨率 (0=同input-size, -1=原分辨率)
+MAX_DISPARITY=24        # 最大视差
 DEPTH_MODE="inverse"     # metric, inverse
 FP16=true               # 启用FP16
 LAYOUT="sbs"            # sbs, ou, overlay, anaglyph
@@ -26,10 +26,17 @@ FLOW_ALIGN=false        # Plan D: 光流对齐 (true/false)
 FLOW_HEIGHT=144         # Plan D: 光流计算分辨率
 MEDIAN_WINDOW=3         # Plan E: 滑窗中值 (1=禁用, 3/5/7推荐)
 HOLE_DILATE_LEFT=2      # 空洞左侧膨胀 (保护前景)
+HOLE_DILATE_RIGHT=1     # 空洞右侧膨胀 (消除轮廓线)
 
 # 空洞修补参数
 FAST_KERNEL=11           # 补洞卷积核大小 (奇数)
 FAST_MAX_ITER=64      # 补洞最大迭代次数
+
+# 边缘敏感补洞参数 (分别尺寸核卷积)
+BG_THRESHOLD=0.3        # 背景深度阈值 (只near<该值算背景)
+EDGE_KERNEL=5           # 边缘区域用小卷积核
+NON_EDGE_KERNEL=11      # 非边缘区域用大卷积核
+EDGE_FILL_MODE=0        # 边缘填充模式: 0=边缘小核/非边缘大核, 1=边缘直接填补, 2=混合模式
 
 # 其他参数
 PROFILE_TIME=true       # 输出性能统计
@@ -74,6 +81,13 @@ Plan A-E 时序稳定 (分别控制):
 空洞修补:
   --fast-kernel <数值>   补洞卷积核大小 (奇数, 默认: $FAST_KERNEL)
   --fast-max-iter <数值> 补洞最大迭代次数 (默认: $FAST_MAX_ITER)
+
+边缘敏感补洞 (分别尺寸核卷积):
+  --hole-dilate-right <数值> 空洞右侧膨胀像素 (消除轮廓线, 默认: $HOLE_DILATE_RIGHT)
+  --bg-threshold <数值>      背景深度阈值 (仅near<该值算背景, 默认: $BG_THRESHOLD)
+  --edge-kernel <数值>       边缘区域用小卷积核 (默认: $EDGE_KERNEL)
+  --non-edge-kernel <数值>   非边缘区域用大卷积核 (默认: $NON_EDGE_KERNEL)
+  --edge-fill-mode <数值>    边缘填充模式: 0=边缘小核/非边缘大核, 1=边缘直接填补, 2=混合模式 (默认: $EDGE_FILL_MODE)
 
 快捷模式:
   --no-plans            禁用所有Plan (纯单帧模式)

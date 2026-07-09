@@ -7,13 +7,13 @@
 #   --fp16 \
 #   --profile-time
 #
-# ============= 【师兄优化版】 =============
+# python mono2stereo.py --video-path ../../dataset/shuai/Huawei/CL_12s.mp4 --outdir ./temple
+# ==================== 【师兄优化版】 ====================
 #   ✅ 原版逻辑完全保留，只修改了 DIBR + inpaint 两块
 #   ✅ DIBR: int64 无损 Z-buffer（彻底消除像素冲突伪影）
 #   ✅ 新增：空洞左侧膨胀（保护前景边缘不被 inpaint 侵蚀）
-#   ✅ 新增：--hole-dilate-left 参数控制膨胀像素
 #
-# ============= 【终极优化：PLAN A-E 时序稳定】 =============
+# ==================== 【终极优化：PLAN A-E 时序稳定】 ====================
 # 五重时序稳定（不损失速度，全部在 "深度推理分辨率" 上完成）：
 #
 #   ✅ Plan A —— 分位数 EMA：消除 DepthAnything V2 每帧 scale/shift
@@ -34,7 +34,22 @@
 #                抗单帧极值噪声；与 EMA 正交，叠加使用效果最稳。
 #
 # 额外新增：深度推理 / DIBR 渲染分辨率彻底解耦（--dibr-size 参数）
-# ============================================================
+# =============================================================================
+
+# ==================== 【Modified: 深度感知空洞修补】 ====================
+#   ✅ fast_inpaint_gpu 现在接受 near_score 参数
+#   ✅ 填充时空洞优先使用背景像素（远的像素）
+#   ✅ 通过深度加权平均，避免前景颜色污染背景区域
+# =============================================================================
+#
+# ==================== 【方案8：轮廓线修复 - 边缘敏感空洞填补】 ====================
+#   ⭐ 问题：前景右侧有细长轮廓线，卷积核大小难以平衡
+#           核太小 → 黑洞残留；核太大 → 前景边缘卷入
+#   🔧 方案：边缘敏感策略，先检测空洞边缘
+#           边缘位置 → 用小卷积核（避免前景卷入），或直接用边缘周围背景像素填补
+#           非边缘位置 → 用正常卷积核填补
+#   💡 用法：--edge-kernel-size 3-5，--non-edge-kernel-size 9-13，--edge-fill-mode 0-2
+# =============================================================================
 
 import sys
 sys.path.insert(0, '.')  # 主目录
@@ -73,24 +88,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-path", type=str, required=True, help="输入视频路径、视频目录或txt列表")
     parser.add_argument("--output", type=str, default="./output.mp4", help="输出视频路径（单文件模式）")
     parser.add_argument("--outdir", type=str, default="./vis_video_3d", help="输出目录（批量模式）")
-    
+
     # ---- 分辨率 ----
-    parser.add_argument("--input-size", type=int, default=518, help="深度模型输入基准高度（必须为14的倍数，决定推理速度）")
-    parser.add_argument("--dibr-size", type=int, default=0, help="DIBR渲染基准高度（-1=原分辨率，0=和input-size一致）")
-    
+    parser.add_argument("--input-size", type=int, default=518, help="深度模型输入基准高度（必须为14的倍数）")
+    parser.add_argument("--dibr-size", type=int, default=294, help="DIBR渲染基准高度（-1=原分辨率，0=和input-size一致）")
+
     parser.add_argument("--encoder", type=str, default="vits", choices=["vits", "vitb", "vitl", "vitg"])
     parser.add_argument("--video-model", action="store_true", help="使用Video-Depth-Anything视频模型（内置时序一致性）")
     parser.add_argument("--metric", action="store_true", help="视频模型使用 metric 深度版本")
     parser.add_argument("--ckpt", type=str, default=None, help="模型权重路径，默认 checkpoints/video_depth_anything_{encoder}.pth")
     parser.add_argument("--fp16", action="store_true", help="CUDA下启用fp16推理")
     parser.add_argument("--warmup-iters", type=int, default=10, help="CUDA warmup轮数")
-    parser.add_argument("--queue-size", type=int, default=8, help="预读队列大小（越大CPU-GPU重叠越好）")
+    parser.add_argument("--queue-size", type=int, default=8, help="预读队列大小（越大CPU-GPU并行越好）")
 
-    parser.add_argument("--max-disparity", type=float, default=16.0, help="原分辨率等效最大水平视差像素，内部自动按DIBR尺寸缩放")
-    parser.add_argument("--depth-mode", choices=["metric", "inverse"], default="metric", help="metric:值小更近；inverse:值大更近")
+    parser.add_argument("--max-disparity", type=float, default=24.0, help="原分辨率等效最大水平视差像素，内部自动按DIBR尺寸缩放")
+    parser.add_argument("--depth-mode", choices=["metric", "inverse"], default="inverse", help="metric:值小更近；inverse:值大更近")
     parser.add_argument("--clip-low", type=float, default=0.01, help="深度归一化低分位")
     parser.add_argument("--clip-high", type=float, default=0.99, help="深度归一化高分位")
-    
+
     # ---- 时序稳定化（Plan A / B / C / D / E） ----
     parser.add_argument("--depth-smooth", type=float, default=0.0,
                         help="【Plan B+C】near空间EMA强度（前帧权重；0=禁用，0.6推荐）")
@@ -98,20 +113,31 @@ def parse_args() -> argparse.Namespace:
                         help="【Plan A】分位数EMA强度（前帧权重；0=禁用，0.8推荐，几乎零开销）")
     parser.add_argument("--rgb-motion-sigma", type=float, default=0.0,
                         help="【Plan B】RGB帧差sigma；越小越敏感于运动；0=禁用自适应（退化为均匀EMA）")
-    
+
     # Plan D: 光流对齐
     parser.add_argument("--flow-align", action="store_true",
                         help="【Plan D】启用CPU Farneback光流补偿的motion-aligned EMA（约+1~3ms/帧）")
     parser.add_argument("--flow-height", type=int, default=144,
-                        help="【Plan D】光流计算分辨率的基准高度；越大越精确越慢，144推荐")
-    
+                        help="【Plan D】光流计算分辨率的基准高度；越大越精确越慢，144推荐）")
+
     # Plan E: 滑窗中值
     parser.add_argument("--median-window", type=int, default=1,
                         help="【Plan E】滑窗中值滤波窗口大小（1=禁用；3推荐；最大7）")
 
-    parser.add_argument("--fast-kernel", type=int, default=7, help="FAST补洞邻域核大小(奇数)")
+    parser.add_argument("--fast-kernel", type=int, default=11, help="FAST补洞邻域核大小(奇数)")
     parser.add_argument("--fast-max-iter", type=int, default=64, help="FAST补洞最大迭代次数")
     parser.add_argument("--hole-dilate-left", type=int, default=0, help="hole向左膨胀像素，保护前景边缘（0=关闭）")
+    parser.add_argument("--hole-dilate-right", type=int, default=1, help="hole向右膨胀像素，消除轮廓线（0=关闭，建议1-2）")
+
+    # ---- 边缘敏感补洞参数 ----
+    parser.add_argument("--bg-threshold", type=float, default=0.3,
+                        help="背景深度阈值：只有near < 该值才被认为是背景（建议0.2-0.4）")
+    parser.add_argument("--edge-kernel-size", type=int, default=5,
+                        help="空洞边缘用的小卷积核大小（建议3-5）")
+    parser.add_argument("--non-edge-kernel-size", type=int, default=11,
+                        help="空洞非边缘区域用的正常卷积核大小（建议9-13）")
+    parser.add_argument("--edge-fill-mode", type=int, default=0,
+                        help="边缘填充模式：0=边缘用小核/非边缘用大核；1=边缘直接用周围背景像素填补；2=混合模式")
 
     parser.add_argument("--layout", choices=["sbs", "ou", "overlay", "anaglyph"], default="sbs", help="sbs并排, ou上下, overlay重合")
     parser.add_argument("--overlay-alpha", type=float, default=0.5, help="overlay模式下右眼权重[0,1]")
@@ -127,6 +153,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-time", action="store_true", help="输出各阶段平均耗时和FPS")
     parser.add_argument("--profile-total", action="store_true", help="输出脚本级端到端总耗时和总平均FPS")
     parser.add_argument("--profile-output", type=str, default=None, help="性能统计保存到文件路径")
+    parser.add_argument("--no-encode", action="store_true", help="不进行ffmpeg编码，只处理帧不输出视频（用于内存测试）")
     return parser.parse_args()
 
 
@@ -221,7 +248,7 @@ class OpticalFlowEstimator:
             self._prev_gray_cpu = gray_cpu
             return None
 
-        # 后向光流：从 curr 到 prev 的位移场
+        # 后向光流：从 curr 到 prev 的位移
         flow_small = cv2.calcOpticalFlowFarneback(
             gray_cpu, self._prev_gray_cpu, None,
             pyr_scale=0.5, levels=3, winsize=15, iterations=3,
@@ -245,7 +272,7 @@ def backward_warp(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     """
     image: [H, W] 或 [C, H, W]
     flow:  [2, H, W] 像素单位的后向光流（curr → prev 偏移）
-    返回:   与 image 同 shape 的 warped 结果（border 填充）
+    return:   与 image 同 shape 的 warped 结果（border 填充）
     """
     H, W = flow.shape[-2:]
     device = flow.device
@@ -275,7 +302,7 @@ def backward_warp(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
 
 
 # =============================================================================
-# 时序稳定化模块（Plan A + B + C + D + E 一体）
+# 时序稳定器模块（Plan A + B + C + D + E 一体）
 # =============================================================================
 
 class TemporalDepthStabilizer:
@@ -360,7 +387,7 @@ class TemporalDepthStabilizer:
 
         # ---------- Plan A: 分位数 EMA + 归一化 ----------
         t0 = time.perf_counter()
-        # M-1: 随机采样 16k 像素算 quantile，误差可忽略，速度提升 ~100×
+        # M-1: 随机采样 16k 像素算 quantile，误差可忽略，速度提升 ~100x
         flat = depth_raw.reshape(-1)
         n_total = flat.numel()
         sample_size = 16384
@@ -518,12 +545,113 @@ def dilate_hole_left(hole: torch.Tensor, dilate_px: int) -> torch.Tensor:
 
 
 @torch.no_grad()
+def dilate_hole_right(hole: torch.Tensor, dilate_px: int, near: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    向右膨胀空洞，用于消除前景右侧的轮廓线
+    hole: 空洞掩码
+    dilate_px: 向右膨胀像素数
+    near: 深度图（可选），如果提供则只膨胀背景区域附近
+    """
+    if dilate_px <= 0:
+        return hole
+
+    out = hole.clone()
+
+    # 向右膨胀：将空洞向右扩展
+    for shift in range(1, dilate_px + 1):
+        out = out | torch.roll(hole, shifts=shift, dims=1)
+
+    # 最左侧边界还原（防止跨到左边缘）
+    out[:, :dilate_px] = hole[:, :dilate_px]
+
+    return out
+
+
+@torch.no_grad()
+def detect_hole_edges(hole_mask: torch.Tensor) -> torch.Tensor:
+    """
+    检测空洞边缘像素：
+    空洞像素并且周围有非空洞像素的位置就是边缘
+    """
+    # 空洞位置
+    is_hole = hole_mask.float().unsqueeze(0).unsqueeze(0)
+    # 周围已知像素数量
+    kernel = torch.ones((1, 1, 3, 3), device=hole_mask.device, dtype=is_hole.dtype)
+    neighbor_count = F.conv2d(1 - is_hole, kernel, padding=1)
+    # 边缘 = 空洞 且 周围有已知像素
+    edge_mask = hole_mask & (neighbor_count[0, 0] > 0.01)
+    return edge_mask
+
+
+@torch.no_grad()
+def fill_edge_with_nearest_bg(img: torch.Tensor, hole: torch.Tensor, edge_mask: torch.Tensor, near: Optional[torch.Tensor], bg_threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    直接用空洞边缘周围的背景像素填补边缘区域
+    """
+    result = img.clone()
+    filled_mask = torch.zeros_like(hole)
+    h, w = hole.shape
+    device = hole.device
+
+    # 构建背景mask
+    if near is not None:
+        bg_mask = ~hole & (near < bg_threshold)
+    else:
+        bg_mask = ~hole
+
+    # 对每个边缘像素，尝试用周围的背景像素填补
+    if torch.any(edge_mask):
+        # 先做一次膨胀，让边缘区域稍微扩展
+        edge_extended = edge_mask.clone()
+        for _ in range(2):
+            edge_extended = edge_extended | torch.roll(edge_extended, shifts=1, dims=1) | torch.roll(edge_extended, shifts=-1, dims=1)
+            edge_extended = edge_extended | torch.roll(edge_extended, shifts=1, dims=0) | torch.roll(edge_extended, shifts=-1, dims=0)
+
+        to_fill = edge_extended & hole
+
+        if torch.any(to_fill):
+            # 用平均池化收集周围背景信息
+            img_nchw = img.permute(2, 0, 1).unsqueeze(0)
+            bg_mask_nchw = bg_mask.unsqueeze(0).unsqueeze(0).float()
+
+            # 加权平均
+            pad = 2
+            kernel1 = torch.ones((1, 1, 5, 5), device=device, dtype=img.dtype)
+            kernel3 = kernel1.repeat(3, 1, 1, 1)
+
+            weighted_img = img_nchw * bg_mask_nchw
+            rgb_sum = F.conv2d(weighted_img, kernel3, padding=pad, groups=3)
+            weight_sum = F.conv2d(bg_mask_nchw, kernel1, padding=pad)
+
+            avg = rgb_sum / weight_sum.clamp_min(1e-6)
+            avg_hwc = avg[0].permute(1, 2, 0)
+
+            # 只填补边缘区域
+            valid_fill = to_fill & (weight_sum[0, 0] > 0.5)
+            if torch.any(valid_fill):
+                result[valid_fill] = avg_hwc[valid_fill]
+                filled_mask[valid_fill] = True
+
+    return result, filled_mask
+
+
+@torch.no_grad()
 def fast_inpaint_gpu(
     image: torch.Tensor, hole_mask: torch.Tensor, kernel_size: int, max_iter: int,
     stage_times: Dict[str, float], profile_sync: bool,
+    near: Optional[torch.Tensor] = None, bg_threshold: float = 0.3,
+    edge_kernel_size: int = 5, non_edge_kernel_size: int = 11, edge_fill_mode: int = 0,
 ) -> torch.Tensor:
-    if kernel_size % 2 == 0:
-        raise ValueError("fast-kernel必须是奇数")
+    """
+    边缘敏感的空洞填补：
+    - edge_fill_mode=0: 边缘用小核，非边缘用大核
+    - edge_fill_mode=1: 边缘直接用周围背景像素填补，非边缘用大核
+    - edge_fill_mode=2: 混合模式，边缘先用背景像素填补，再统一处理
+    """
+    if edge_kernel_size % 2 == 0:
+        raise ValueError("edge-kernel必须是奇数")
+    if non_edge_kernel_size % 2 == 0:
+        raise ValueError("non-edge-kernel必须是奇数")
 
     t0 = time.perf_counter()
     img = image.clone()
@@ -531,40 +659,129 @@ def fast_inpaint_gpu(
     if not torch.any(hole):
         _stage_add(stage_times, "inpaint_skip_no_holes", time.perf_counter() - t0)
         return img
+
     device = img.device
 
-    pad = kernel_size // 2
-    kernel1, kernel3 = _get_inpaint_kernels(
-        kernel_size, str(device), str(img.dtype).split('.')[-1]
-    )
+    # ========== 步骤1：检测空洞边缘 ==========
+    edge_mask = detect_hole_edges(hole)
     _maybe_sync(device, profile_sync)
-    _stage_add(stage_times, "inpaint_init_kernel", time.perf_counter() - t0)
+    _stage_add(stage_times, "inpaint_detect_edges", time.perf_counter() - t0)
 
+    # ========== 步骤2（模式1/2）：先直接填补边缘区域 ==========
+    if edge_fill_mode in (1, 2):
+        t0 = time.perf_counter()
+        img, edge_filled = fill_edge_with_nearest_bg(img, hole, edge_mask, near, bg_threshold)
+        hole[edge_filled] = False
+        _maybe_sync(device, profile_sync)
+        _stage_add(stage_times, "inpaint_edge_direct_fill", time.perf_counter() - t0)
+
+    # ========== 步骤3：获取两个卷积核 ==========
+    edge_pad = edge_kernel_size // 2
+    non_edge_pad = non_edge_kernel_size // 2
+    edge_kernel1, edge_kernel3 = _get_inpaint_kernels(
+        edge_kernel_size, str(device), str(img.dtype).split('.')[-1]
+    )
+    non_edge_kernel1, non_edge_kernel3 = _get_inpaint_kernels(
+        non_edge_kernel_size, str(device), str(img.dtype).split('.')[-1]
+    )
+
+    # ========== 步骤4：构建背景权重 ==========
+    if near is not None:
+        is_bg = (near < bg_threshold).to(img.dtype)
+        bg_w = is_bg.unsqueeze(0).unsqueeze(0)
+    else:
+        bg_w = torch.ones((1, 1, *hole.shape), device=device, dtype=img.dtype)
+
+    _maybe_sync(device, profile_sync)
+
+    # ========== 步骤5：迭代填补 ==========
     t0 = time.perf_counter()
     iter_count = 0
     for _ in range(max_iter):
         iter_count += 1
-        known = (~hole).float().unsqueeze(0).unsqueeze(0)
-        if torch.count_nonzero(hole) == 0:
+        if not torch.any(hole):
             break
-        img_nchw = img.permute(2, 0, 1).unsqueeze(0)
-        rgb_sum = F.conv2d(img_nchw * known, kernel3, padding=pad, groups=3)
-        count = F.conv2d(known, kernel1, padding=pad).clamp_min(1e-6)
-        avg = rgb_sum / count
-        fillable = hole & (count[0, 0] > 0)
-        if not torch.any(fillable):
-            break
-        avg_hwc = avg[0].permute(1, 2, 0)
-        img[fillable] = avg_hwc[fillable]
-        hole[fillable] = False
-    _maybe_sync(device, profile_sync)
-    _stage_add(stage_times, f"inpaint_conv_{iter_count}iter", time.perf_counter() - t0)
 
+        filled_this_iter = torch.zeros_like(hole)
+        known = (~hole).float().unsqueeze(0).unsqueeze(0)
+        w = known * bg_w
+
+        # 分开处理边缘和非边缘区域
+        # --- 边缘区域：用小卷积核 ---
+        # 每次迭代时，剩下的hole的边缘可能会变化
+        current_edge_mask = detect_hole_edges(hole) & hole
+
+        if torch.any(current_edge_mask):
+            # 小核计算
+            edge_count = F.conv2d(w, edge_kernel1, padding=edge_pad)
+            edge_fillable = current_edge_mask & (edge_count[0, 0] > 0.01)
+
+            if torch.any(edge_fillable):
+                img_nchw = img.permute(2, 0, 1).unsqueeze(0)
+                edge_rgb_sum = F.conv2d(img_nchw * w, edge_kernel3, padding=edge_pad, groups=3)
+                edge_avg = edge_rgb_sum / edge_count.clamp_min(1e-6)
+                edge_avg_hwc = edge_avg[0].permute(1, 2, 0)
+
+                img[edge_fillable] = edge_avg_hwc[edge_fillable]
+                hole[edge_fillable] = False
+                filled_this_iter |= edge_fillable
+
+        # --- 非边缘区域：用大卷积核 ---
+        if torch.any(hole):
+            non_edge_mask = hole & (~current_edge_mask)
+
+            if torch.any(non_edge_mask):
+                non_edge_count = F.conv2d(w, non_edge_kernel1, padding=non_edge_pad)
+                non_edge_fillable = non_edge_mask & (non_edge_count[0, 0] > 0.01)
+
+                if torch.any(non_edge_fillable):
+                    img_nchw = img.permute(2, 0, 1).unsqueeze(0)
+                    non_edge_rgb_sum = F.conv2d(img_nchw * w, non_edge_kernel3, padding=non_edge_pad, groups=3)
+                    non_edge_avg = non_edge_rgb_sum / non_edge_count.clamp_min(1e-6)
+                    non_edge_avg_hwc = non_edge_avg[0].permute(1, 2, 0)
+
+                    img[non_edge_fillable] = non_edge_avg_hwc[non_edge_fillable]
+                    hole[non_edge_fillable] = False
+                    filled_this_iter |= non_edge_fillable
+
+        # 如果这轮没填补任何像素，说明周围没有可用背景了，退出
+        if not torch.any(filled_this_iter):
+            break
+
+    _maybe_sync(device, profile_sync)
+    _stage_add(stage_times, f"inpaint_edge_aware_{iter_count}iter", time.perf_counter() - t0)
+
+    # ========== 步骤6：兜底填充（如果还有剩下的洞） ==========
     t0 = time.perf_counter()
     if torch.any(hole):
-        img[hole] = image[hole]
+        # 放松限制，用任何已知像素填补
+        for _ in range(max_iter // 2):
+            if not torch.any(hole):
+                break
+
+            fallback_known = (~hole).float().unsqueeze(0).unsqueeze(0)
+            count = F.conv2d(fallback_known, non_edge_kernel1, padding=non_edge_pad)
+            fillable = hole & (count[0, 0] > 0.01)
+
+            if not torch.any(fillable):
+                break
+
+            img_nchw = img.permute(2, 0, 1).unsqueeze(0)
+            rgb_sum = F.conv2d(img_nchw * fallback_known, non_edge_kernel3, padding=non_edge_pad, groups=3)
+            avg = rgb_sum / count.clamp_min(1e-6)
+            avg_hwc = avg[0].permute(1, 2, 0)
+
+            img[fillable] = avg_hwc[fillable]
+            hole[fillable] = False
+
     _maybe_sync(device, profile_sync)
-    _stage_add(stage_times, "inpaint_final_fill_remaining", time.perf_counter() - t0)
+    _stage_add(stage_times, "inpaint_final_fallback", time.perf_counter() - t0)
+
+    # 最差情况：还有洞，用全图平均
+    if torch.any(hole):
+        known_pixels = image[~hole_mask]
+        fallback = known_pixels.mean(dim=0) if known_pixels.numel() > 0 else torch.zeros(3, device=device, dtype=img.dtype)
+        img[hole] = fallback
 
     return img
 
@@ -622,7 +839,7 @@ def create_nvenc_writer(
     # yuv420p 要求宽高为偶数，如果是奇数就用 yuv444p
     pix_fmt = "yuv420p" if (out_w % 2 == 0 and out_h % 2 == 0) else "yuv444p"
     if pix_fmt != "yuv420p":
-        print(f"[mono2stereo] ⚠️  分辨率 {out_w}x{out_h} 有奇数，使用 {pix_fmt}")
+        print(f"[mono2stereo] ⚠️  分辨率 {out_w}×{out_h} 有奇数，使用 {pix_fmt}")
 
     def build_cmd(enc: str) -> list:
         cmd = [
@@ -784,7 +1001,7 @@ def main() -> None:
             raise ImportError(
                 "\n" + "="*70 + "\n"
                 "Video-Depth-Anything 导入失败！\n"
-                "请确认 submodules/Video-Depth-Anything 目录存在\n"
+                "请确认 submodules/Video_Depth_Anything 目录存在\n"
                 "或者先不加 --video-model，用单帧 + 时序稳定A-E模式\n"
                 + "="*70
             )
@@ -843,6 +1060,10 @@ def main() -> None:
             f"{f' (h={args.flow_height})' if args.flow_align else ''} (D), "
             f"median_window={args.median_window} (E)"
         )
+
+    # 深度感知补洞提示
+    mode_names = ["边缘小核/非边缘大核", "边缘直接填补+非边缘大核", "混合模式"]
+    print(f"[mono2stereo] 🎨 边缘敏感空洞修补: {mode_names[args.edge_fill_mode]} (edge_kernel={args.edge_kernel_size}, non_edge_kernel={args.non_edge_kernel_size}, bg_threshold={args.bg_threshold})")
 
     files = collect_video_files(args.video_path)
     if not files:
@@ -912,7 +1133,7 @@ def main() -> None:
             # 如果是 h264_nvenc，先试试 sbs 宽度是否超限制
             sbs_w = w_orig * 2
             nvenc_max_w = 4096  # 经过测试，当前环境 NVENC 最大宽度支持超过 4096，但 5152 不行
-            if use_layout == "sbs" and sbs_w > 4096:
+            if use_layout == "sbs" and sbs_w > nvenc_max_w:
                 print(f"[mono2stereo] ⚠️  sbs 模式宽度 {sbs_w} 超过 NVENC 限制，自动切换到 ou 模式")
                 use_layout = "ou"
 
@@ -924,20 +1145,25 @@ def main() -> None:
         else:
             out_w, out_h = w_orig, h_orig
 
-        if is_single_file:
-            out_path = args.output
+        if args.no_encode:
+            print("[mono2stereo] ⏭️  禁用ffmpeg编码模式，只处理帧不输出视频")
+            writer = None
+            out_path = "memory_test_mode"
         else:
-            out_path = os.path.join(args.outdir, f"{Path(filename).stem}_3d.mp4")
+            if is_single_file:
+                out_path = args.output
+            else:
+                out_path = os.path.join(args.outdir, f"{Path(filename).stem}_3d.mp4")
 
-        writer = create_nvenc_writer(
-            ffmpeg_bin=args.ffmpeg_bin, input_video=filename, output_video=out_path,
-            fps=fps_orig, out_w=out_w, out_h=out_h,
-            encoder=args.video_encoder, nvenc_gpu=args.nvenc_gpu,
-            preset=args.nvenc_preset, cq=args.nvenc_cq,
-        )
-        if writer.stdin is None:
-            cap.release()
-            raise RuntimeError("ffmpeg管道初始化失败")
+            writer = create_nvenc_writer(
+                ffmpeg_bin=args.ffmpeg_bin, input_video=filename, output_video=out_path,
+                fps=fps_orig, out_w=out_w, out_h=out_h,
+                encoder=args.video_encoder, nvenc_gpu=args.nvenc_gpu,
+                preset=args.nvenc_preset, cq=args.nvenc_cq,
+            )
+            if writer.stdin is None:
+                cap.release()
+                raise RuntimeError("ffmpeg管道初始化失败")
 
         stage_times: Dict[str, float] = {}
         processed_frames = 0
@@ -984,16 +1210,20 @@ def main() -> None:
                     use_stabilizer = args.quantile_smooth > 0 or args.depth_smooth > 0 or args.flow_align or args.median_window > 1
                     need_two_res = (dibr_h != depth_h or dibr_w != depth_w) or use_stabilizer
                     if need_two_res:
+                        preprocess_t0 = time.perf_counter()
                         model_input, left_rgb_dibr, rgb_depth = prepare_inputs_dual_res_gpu(
                             frame_bgr, device, (depth_h, depth_w), (dibr_h, dibr_w),
                             MEAN, STD, stage_times, args.profile_time,
                         )
+                        _stage_add(stage_times, "preprocess_total", time.perf_counter() - preprocess_t0)
                     else:
                         # 时序稳定都禁用且 dibr-size == input-size，用简化预处理
+                        preprocess_t0 = time.perf_counter()
                         model_input, left_rgb_dibr, _ = prepare_inputs_dual_res_gpu(
                             frame_bgr, device, (depth_h, depth_w), (depth_h, depth_w),
                             MEAN, STD, stage_times, args.profile_time,
                         )
+                        _stage_add(stage_times, "preprocess_total", time.perf_counter() - preprocess_t0)
 
                     if args.fp16:
                         model_input = model_input.half()
@@ -1002,12 +1232,6 @@ def main() -> None:
                         model, model_input, args.fp16, stage_times, args.profile_time
                     )
                     _stage_add(stage_times, "infer_depth_total", time.perf_counter() - t0)
-
-                    # 累加预处理总耗时
-                    _stage_add(stage_times, "preprocess_total",
-                        stage_times.get("prep_h2d", 0) +
-                        stage_times.get("prep_color_and_resize_gpu", 0) +
-                        stage_times.get("prep_normalize", 0))
 
                     # ========== Step 2: 深度归一化 + near 转换 ==========
                     t0 = time.perf_counter()
@@ -1036,10 +1260,11 @@ def main() -> None:
                 if args.video_model:
                     # 视频模式：简单处理
                     if args.depth_mode == "inverse":
-                        near = depth_raw
+                        near_v = depth_raw
                     else:
-                        near = 1.0 - depth_raw
-                    disparity = near * args.max_disparity
+                        near_v = 1.0 - depth_raw
+                    disparity = near_v * args.max_disparity
+                    near_for_inpaint = near_v
                 else:
                     # 单帧模式：GPU重采样到 DIBR 分辨率（如果需要）
                     if (dibr_h == depth_h and dibr_w == depth_w):
@@ -1050,6 +1275,7 @@ def main() -> None:
                             mode="bilinear", align_corners=False,
                         )[0, 0]
                     disparity = near_dibr * max_disparity_dibr
+                    near_for_inpaint = near_dibr
                     _maybe_sync(device, args.profile_time)
                     _stage_add(stage_times, "near_resample_gpu", time.perf_counter() - t0)
 
@@ -1059,7 +1285,7 @@ def main() -> None:
                 t0 = time.perf_counter()
                 right_rgb_dibr, hole_dibr = forward_warp_right_gpu(
                     left_rgb_dibr, disparity,
-                    near_smooth if args.video_model else near_dibr,
+                    near_for_inpaint,  # 传递 near score 给 DIBR（用于 Z-buffer）
                     stage_times, args.profile_time
                 )
                 if args.profile_time:
@@ -1076,12 +1302,25 @@ def main() -> None:
                 else:
                     hole_dilated = hole_dibr
 
-                # ========== Step 5: GPU 快速补洞 ==========
+                # ========== 空洞右侧膨胀（方案5：消除轮廓线）==========
+                if args.hole_dilate_right > 0:
+                    t0 = time.perf_counter()
+                    hole_dilated = dilate_hole_right(hole_dilated, args.hole_dilate_right, near_for_inpaint)
+                    if args.profile_time:
+                        torch.cuda.synchronize()
+                    _stage_add(stage_times, "hole_dilate_right", time.perf_counter() - t0)
+
+                # ========== Step 5: GPU 快速补洞（边缘敏感版）==========
                 t0 = time.perf_counter()
                 right_inpainted_dibr = fast_inpaint_gpu(
                     right_rgb_dibr, hole_mask=hole_dilated,
                     kernel_size=args.fast_kernel, max_iter=args.fast_max_iter,
                     stage_times=stage_times, profile_sync=args.profile_time,
+                    near=near_for_inpaint,  # 传递深度信息
+                    bg_threshold=args.bg_threshold,  # 背景深度阈值
+                    edge_kernel_size=args.edge_kernel_size,  # 边缘用小核
+                    non_edge_kernel_size=args.non_edge_kernel_size,  # 非边缘用大核
+                    edge_fill_mode=args.edge_fill_mode,  # 边缘填充模式
                 )
                 if args.profile_time:
                     torch.cuda.synchronize()
@@ -1106,31 +1345,36 @@ def main() -> None:
                 stereo = compose_stereo(left_u8, right_u8, use_layout, args.overlay_alpha)
                 _stage_add(stage_times, "compose_stereo", time.perf_counter() - t0)
 
-                # ========== Step 7: 写入 ffmpeg ==========
+                # ========== Step 7: 写入 ffmpeg (--no-encode 模式下跳过) ==========
                 t0 = time.perf_counter()
-                writer.stdin.write(stereo.tobytes())
+                if writer is not None:
+                    writer.stdin.write(stereo.tobytes())
                 _stage_add(stage_times, "write_to_ffmpeg", time.perf_counter() - t0)
 
                 _stage_add(stage_times, "total_per_frame", time.perf_counter() - frame_t0)
                 processed_frames += 1
                 all_processed_frames += 1
                 if processed_frames % 30 == 0:
-                    print(f"[mono2stereo] {Path(filename).name} rendered {processed_frames} frames")
+                    print(f"[mono2stereo] {Path(filename).stem} rendered {processed_frames} frames")
         finally:
             reader.stop()
             cap.release()
-            writer.stdin.close()
-            # 读取stderr看报错信息
-            stderr_output = writer.stderr.read().decode('utf-8', errors='replace')
-            ret = writer.wait()
-            if ret != 0:
-                if stderr_output:
-                    print(f"\n[mono2stereo] ❌ ffmpeg 错误信息:\n{stderr_output}")
-                raise RuntimeError(f"ffmpeg编码失败，退出码: {ret}")
+            if writer is not None:
+                writer.stdin.close()
+                # 读取stderr看报错信息
+                stderr_output = writer.stderr.read().decode('utf-8', errors='replace')
+                ret = writer.wait()
+                if ret != 0:
+                    if stderr_output:
+                        print(f"\n[mono2stereo] ❌ ffmpeg 错误信息:\n{stderr_output}")
+                    raise RuntimeError(f"ffmpeg编码失败，退出码: {ret}")
 
         total_elapsed = time.perf_counter() - t_video0
         avg_fps = processed_frames / max(total_elapsed, 1e-6)
-        print(f"[mono2stereo] output={out_path}")
+        if writer is None:
+            print(f"[mono2stereo] ⏭️  编码已禁用（内存测试模式）")
+        else:
+            print(f"[mono2stereo] output={out_path}")
         print(f"[mono2stereo] processed_frames={processed_frames}, total_time={total_elapsed:.3f}s, avg_fps={avg_fps:.3f}")
 
         if args.profile_time and processed_frames > 0:
@@ -1142,17 +1386,17 @@ def main() -> None:
             profile_lines.append("")
 
             top_level = [
-                ("read_frame_queue", "从队列取帧 (后台预读)"),
+                ("read_frame_queue", "从队列拿帧 (后台预读)"),
                 ("preprocess_total", "⚡ 输入预处理总耗时"),
                 ("infer_depth_total", "⚡ 深度推理总耗时"),
                 ("stabilize_total", "🌟 时序稳定总耗时 (Plan A+B+C+D+E)"),
                 ("near_resample_gpu", "⚡ near空间GPU双线性重采样到DIBR分辨率"),
                 ("near_to_disparity", "near → disparity"),
                 ("gpu_warp_total", "⚡ DIBR图像扭曲总耗时 (int64)"),
-                ("hole_dilate_left", "空洞左侧膨胀(保护前景)"),
-                ("fast_inpaint_total", "⚡ 快速补洞总耗时"),
+                ("hole_dilate_left", "空洞左侧膨胀 (保护前景)"),
+                ("fast_inpaint_total", "⚡ 快速补洞总耗时 (深度感知版)"),
                 ("to_cpu_numpy", "结果转回CPU"),
-                ("upsample_to_orig_cpu", "上采样回原分辨率(CPU)"),
+                ("upsample_to_orig_cpu", "上采样回原分辨率 (CPU)"),
                 ("compose_stereo", "立体帧拼接合成"),
                 ("write_to_ffmpeg", "写入ffmpeg编码"),
             ]
@@ -1174,8 +1418,8 @@ def main() -> None:
                 ("prep_h2d", "原图传到GPU"),
                 ("prep_color_and_resize_gpu", "BGR转RGB + 双分辨率Resize (全GPU)"),
                 ("prep_normalize", "Normalize标准化 (GPU)"),
-                ("model_inference", "⭐ DepthAnything模型推理(单帧)"),
-                ("model_inference_video", "⭐ DepthAnything模型推理(视频多帧)"),
+                ("model_inference", "⭐ DepthAnything模型推理 (单帧)"),
+                ("model_inference_video", "⭐ DepthAnything模型推理 (视频多帧)"),
             ]
             depth_parent = "infer_depth_total"
             if depth_parent in stage_times:
@@ -1238,14 +1482,14 @@ def main() -> None:
                     t_avg = t / processed_frames * 1000
                     ratio = (t / parent_time * 100.0) if parent_time > 0 else 0.0
                     if key == "inpaint_skip_no_holes":
-                        cn_name = "跳过(无空洞)"
+                        cn_name = "跳过 (无空洞)"
                     elif key == "inpaint_init_kernel":
                         cn_name = "初始化卷积核"
                     elif key == "inpaint_final_fill_remaining":
                         cn_name = "剩余空洞兜底"
                     elif key.startswith("inpaint_conv_"):
                         iters = key.replace("inpaint_conv_", "").replace("iter", "")
-                        cn_name = f"卷积迭代 ({iters}次)"
+                        cn_name = f"卷积迭代 ({iters}次) [深度感知]"
                     else:
                         cn_name = ""
                     profile_lines.append(f"  ├─ {key:25s} {t:8.3f}s ({ratio:5.1f}%) | {t_avg:6.1f}ms/帧 | {cn_name}")
@@ -1261,14 +1505,18 @@ def main() -> None:
             # 保存到文件（如果指定了路径或默认保存）
             profile_file = args.profile_output
             if profile_file is None:
-                # 默认保存在输出视频同目录下，同名 .txt 文件
-                profile_file = Path(out_path).with_suffix('.txt')
+                if writer is None:
+                    # 内存测试模式：保存在当前目录
+                    profile_file = Path(args.outdir) / f"{Path(filename).stem}_memory_test.txt"
+                else:
+                    # 默认保存在输出视频同目录下，同名 .txt 文件
+                    profile_file = Path(out_path).with_suffix('.txt')
 
             try:
                 os.makedirs(os.path.dirname(profile_file), exist_ok=True)
                 with open(profile_file, 'w', encoding='utf-8') as f:
                     # 写入基本信息
-                    f.write(f"=== 2D转3D 性能统计 ===\n")
+                    f.write(f"=== 2D转3D 性能统计 (深度感知补洞版) ===\n")
                     f.write(f"视频文件: {filename}\n")
                     f.write(f"输出文件: {out_path}\n")
                     f.write(f"原始分辨率: {w_orig}×{h_orig}\n")
@@ -1278,6 +1526,13 @@ def main() -> None:
                     f.write(f"输入尺寸: {args.input_size}\n")
                     f.write(f"最大视差: {args.max_disparity}\n")
                     f.write(f"FP16: {args.fp16}\n")
+                    f.write(f"边缘敏感补洞 (方案8): 是\n")
+                    f.write(f"bg_threshold: {args.bg_threshold}\n")
+                    f.write(f"edge_kernel_size: {args.edge_kernel_size}\n")
+                    f.write(f"non_edge_kernel_size: {args.non_edge_kernel_size}\n")
+                    f.write(f"edge_fill_mode: {args.edge_fill_mode}\n")
+                    f.write(f"hole_dilate_left: {args.hole_dilate_left}\n")
+                    f.write(f"hole_dilate_right: {args.hole_dilate_right}\n")
                     f.write(f"\n=== Plan配置 ===\n")
                     f.write(f"quantile_smooth (Plan A): {args.quantile_smooth}\n")
                     f.write(f"depth_smooth (Plan B+C): {args.depth_smooth}\n")
