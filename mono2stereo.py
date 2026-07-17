@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
 
     # ---- 分辨率 ----
     parser.add_argument("--input-size", type=int, default=518, help="深度模型输入基准高度（必须为14的倍数）")
-    parser.add_argument("--dibr-size", type=int, default=294, help="DIBR渲染基准高度（-1=原分辨率，0=和input-size一致）")
+    parser.add_argument("--dibr-size", type=int, default=-1, help="DIBR渲染基准高度（-1=原分辨率，0=和input-size一致）")
 
     parser.add_argument("--encoder", type=str, default="vits", choices=["vits", "vitb", "vitl", "vitg"])
     parser.add_argument("--video-model", action="store_true", help="使用Video-Depth-Anything视频模型（内置时序一致性）")
@@ -488,11 +488,20 @@ def forward_warp_right_gpu(
     _stage_add(stage_times, "warp_grid_gen", time.perf_counter() - t0)
 
     t0 = time.perf_counter()
-    src_lin = (ys * w + xs).reshape(-1)
-    tgt_lin = (ys * w + x_tgt).reshape(-1)
-    valid_flat = valid.reshape(-1)
+    # fill_right 方案：每个像素同时填 x_tgt 和 x_tgt+1
+    # 解决 round 取整在视差梯度大的边缘产生的间隙黑洞
+    src_flat = (ys * w + xs).reshape(-1)
+    tgt1_flat = (ys * w + x_tgt).reshape(-1)
+    tgt2_flat = (ys * w + (x_tgt + 1)).reshape(-1)  # 额外填右边一个像素
     near_flat = near_score.reshape(-1)
 
+    # 合并两个目标位置
+    src_lin = torch.cat([src_flat, src_flat])
+    tgt_lin = torch.cat([tgt1_flat, tgt2_flat])
+    near_flat = torch.cat([near_flat, near_flat])
+
+    # 统一过滤越界
+    valid_flat = (tgt_lin >= 0) & (tgt_lin < N)
     src_lin = src_lin[valid_flat]
     tgt_lin = tgt_lin[valid_flat]
     near_flat = near_flat[valid_flat]
@@ -1204,7 +1213,20 @@ def main() -> None:
                     # 视频模式：DIBR 用原图分辨率
                     left_rgb_dibr = torch.from_numpy(frame_bgr).to(device=device, dtype=torch.float32)
                     left_rgb_dibr = left_rgb_dibr.flip(-1) / 255.0  # BGR→RGB
-                    near_smooth = depth_raw  # 视频模型自带时序，直接用
+
+                    # ========== VDA 深度归一化 ==========
+                    # VDA 输出是 metric depth (~0.5~12)，必须先归一化到 [0,1]
+                    t0 = time.perf_counter()
+                    flat = depth_raw.reshape(-1)
+                    sample_size = 16384
+                    idx = torch.randint(0, flat.numel(), (sample_size,), device=flat.device)
+                    sample = flat[idx]
+                    q_vals = torch.quantile(sample, torch.tensor([args.clip_low, args.clip_high], device=flat.device))
+                    low, high = q_vals[0], q_vals[1]
+                    denom = (high - low).clamp_min(1e-6)
+                    depth_norm = ((depth_raw - low) / denom).clamp(0.0, 1.0)
+                    near_smooth = depth_norm if args.depth_mode == "inverse" else (1.0 - depth_norm)
+                    _stage_add(stage_times, "vda_depth_norm", time.perf_counter() - t0)
                 else:
                     # 单帧模式预处理
                     use_stabilizer = args.quantile_smooth > 0 or args.depth_smooth > 0 or args.flow_align or args.median_window > 1
@@ -1258,13 +1280,9 @@ def main() -> None:
                 # ========== Step 3: near → disparity ==========
                 t0 = time.perf_counter()
                 if args.video_model:
-                    # 视频模式：简单处理
-                    if args.depth_mode == "inverse":
-                        near_v = depth_raw
-                    else:
-                        near_v = 1.0 - depth_raw
-                    disparity = near_v * args.max_disparity
-                    near_for_inpaint = near_v
+                    # 视频模式：near_smooth 已在上方归一化到 [0,1]
+                    disparity = near_smooth * args.max_disparity
+                    near_for_inpaint = near_smooth
                 else:
                     # 单帧模式：GPU重采样到 DIBR 分辨率（如果需要）
                     if (dibr_h == depth_h and dibr_w == depth_w):
